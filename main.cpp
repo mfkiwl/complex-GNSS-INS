@@ -185,6 +185,7 @@ struct NavigationState {
     int satellites_visible;
     int current_waypoint;
     double distance_to_next;
+    double current_speed_kmh;
     
     NavigationState(
         const Position& pos = Position(),
@@ -194,7 +195,8 @@ struct NavigationState {
         double hdop_val = 0.0,
         int sats = 0,
         int waypoint = 0,
-        double dist = 0.0
+        double dist = 0.0,
+        double speed = 0.0
     ) : position(pos),
         deviation(dev),
         is_running(running),
@@ -202,16 +204,19 @@ struct NavigationState {
         hdop(hdop_val),
         satellites_visible(sats),
         current_waypoint(waypoint),
-        distance_to_next(dist) {}
+        distance_to_next(dist),
+        current_speed_kmh(speed) {}
 
-    std::string toString() const {
+     std::string toString() const {
         std::stringstream ss;
         ss << "Position: " << position.toString() 
            << "\nDeviation: " << std::fixed << std::setprecision(2) << deviation << "m"
            << "\nGNSS: " << (gnss_available ? "Available" : "Unavailable")
            << " (HDOP:" << hdop << " Sats:" << satellites_visible << ")"
            << "\nWaypoint: " << current_waypoint 
-           << " Distance: " << distance_to_next << "m";
+           << "\nDistance to next: " << distance_to_next << "m"
+           << "\nCurrent speed: " << std::fixed << std::setprecision(1) 
+           << current_speed_kmh << " km/h";
         return ss.str();
     }
 };
@@ -415,14 +420,27 @@ public:
             // Преобразуем курс в радианы
             double bearing_rad = bearing * PI / 180.0;
 
-            // Вычисляем желаемую скорость
-            double desired_speed = std::min(target_speed_, distance);
+            // Определяем желаемую скорость
+            double desired_speed;
+            if (distance < 10.0) { // Если близко к цели
+                desired_speed = std::min(target_speed_ * (distance / 10.0), target_speed_);
+            } else {
+                desired_speed = target_speed_;
+            }
             
+            double lat_rad = current_position_.latitude * PI / 180.0;
+            
+            // Масштабные коэффициенты для преобразования градусов в метры
+            double meters_per_degree_lat = 111132.92 - 559.82 * cos(2.0 * lat_rad) + 
+                                         1.175 * cos(4.0 * lat_rad) - 0.0023 * cos(6.0 * lat_rad);
+            double meters_per_degree_lon = 111412.84 * cos(lat_rad) - 
+                                         93.5 * cos(3.0 * lat_rad) + 0.118 * cos(5.0 * lat_rad);
+
             // Вычисляем желаемые компоненты скорости
             Eigen::Vector3d desired_velocity;
-            desired_velocity.x() = desired_speed * std::cos(bearing_rad);
-            desired_velocity.y() = desired_speed * std::sin(bearing_rad);
-            desired_velocity.z() = (target_position.altitude - current_position_.altitude) / dt;
+            desired_velocity.x() = desired_speed * cos(bearing_rad);
+            desired_velocity.y() = desired_speed * sin(bearing_rad);
+            desired_velocity.z() = (target_position.altitude - current_position_.altitude) * 0.2;
 
             // Ограничиваем ускорение
             Eigen::Vector3d velocity_diff = desired_velocity - velocity_;
@@ -434,27 +452,38 @@ public:
             velocity_ += velocity_diff;
             
             // Обновляем позицию
-            double dlat = velocity_.x() * dt / EARTH_RADIUS * (180.0 / PI);
-            double dlon = velocity_.y() * dt / (EARTH_RADIUS * 
-                         cos(current_position_.latitude * PI / 180.0)) * (180.0 / PI);
+            double dlat = velocity_.x() * dt / meters_per_degree_lat;
+            double dlon = velocity_.y() * dt / meters_per_degree_lon;
+            double dalt = velocity_.z() * dt;
             
             current_position_.latitude += dlat;
             current_position_.longitude += dlon;
-            current_position_.altitude += velocity_.z() * dt;
+            current_position_.altitude += dalt;
 
             // Логируем обновление состояния
             std::stringstream ss;
-            ss << "UAV state updated:"
+            ss << std::fixed << std::setprecision(6)
+               << "UAV state:"
                << "\nPosition: " << current_position_.toString()
-               << "\nVelocity: " << velocity_.norm() << " m/s"
+               << "\nActual speed: " << velocity_.norm() << " m/s"
+               << "\nDesired speed: " << desired_speed << " m/s"
+               << "\nDistance to target: " << distance << " m"
                << "\nBearing: " << bearing << "°"
-               << "\nDistance to target: " << distance << "m";
+               << "\nVelocity components (m/s):"
+               << "\n  N-S: " << velocity_.x()
+               << "\n  E-W: " << velocity_.y()
+               << "\n  Vertical: " << velocity_.z();
             Logger::log(Logger::DEBUG, ss.str());
         }
         catch (const std::exception& e) {
             Logger::log(Logger::ERROR, "Error updating UAV state: " + std::string(e.what()));
             throw;
         }
+    }
+
+    double getCurrentSpeedKmh() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return velocity_.norm() * 3.6; // переводим м/с в км/ч
     }
 
     Position getPosition() const {
@@ -583,22 +612,38 @@ private:
     double position_error_stddev_;
     mutable std::mutex gnss_mutex_;
     
-    // Параметры моделирования помех
     struct SignalQuality {
         double base_hdop;
         int base_satellites;
         double interference_level;
+        double time_varying_factor;  // Добавляем фактор временной вариации
         
         SignalQuality() 
             : base_hdop(1.0)
             , base_satellites(12)
-            , interference_level(0.0) {}
+            , interference_level(0.0)
+            , time_varying_factor(0.0) {}
     } signal_quality_;
+
+    // Вспомогательная функция для обновления качества сигнала
+    void updateSignalQuality() {
+        // Обновляем временной фактор с некоторой случайностью
+        signal_quality_.time_varying_factor = 0.3 * std::sin(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count() * 0.01
+        ) + noise_dist_(gen_) * 0.2;
+
+        // Добавляем случайные помехи
+        double interference = std::abs(noise_dist_(gen_)) * 0.2 + 
+                            signal_quality_.time_varying_factor;
+        signal_quality_.interference_level = std::clamp(interference, 0.0, 1.0);
+    }
 
 public:
     GNSS() 
         : gen_(rd_())
-        , noise_dist_(0.0, 5.0)
+        , noise_dist_(0.0, 0.1)  // Уменьшаем стандартное отклонение шума
         , position_error_stddev_(5.0)
     {
         Logger::log(Logger::INFO, "GNSS initialized");
@@ -608,34 +653,44 @@ public:
         std::lock_guard<std::mutex> lock(gnss_mutex_);
         
         try {
+            updateSignalQuality();  // Обновляем качество сигнала
+
             GNSSData data;
             
-            // Моделирование ошибок позиционирования
+            // Моделирование ошибок позиционирования с учетом HDOP
             double position_error = position_error_stddev_ * (1.0 + signal_quality_.interference_level);
             data.position.latitude = true_position.latitude + 
                 noise_dist_(gen_) * position_error / EARTH_RADIUS * (180.0 / PI);
             data.position.longitude = true_position.longitude + 
                 noise_dist_(gen_) * position_error / (EARTH_RADIUS * 
                 cos(true_position.latitude * PI / 180.0)) * (180.0 / PI);
-            data.position.altitude = true_position.altitude + noise_dist_(gen_) * position_error;
+            data.position.altitude = true_position.altitude + 
+                noise_dist_(gen_) * position_error;
 
             // Моделирование ошибок скорости
             for(int i = 0; i < 3; ++i) {
                 data.velocity(i) = true_velocity(i) + noise_dist_(gen_) * 0.1;
             }
 
-            // Моделирование качества сигнала
-            data.hdop = signal_quality_.base_hdop * (1.0 + std::abs(noise_dist_(gen_)) * 
-                       signal_quality_.interference_level);
-            data.satellites_visible = static_cast<int>(signal_quality_.base_satellites * 
-                (1.0 - signal_quality_.interference_level));
+            // Расчет HDOP и количества спутников
+            data.hdop = signal_quality_.base_hdop * 
+                       (1.0 + std::abs(signal_quality_.interference_level));
+            
+            data.satellites_visible = static_cast<int>(std::round(
+                signal_quality_.base_satellites * 
+                (1.0 - signal_quality_.interference_level * 0.5)
+            ));
+
+            // Гарантируем минимальные значения
+            data.hdop = std::max(0.8, data.hdop);
+            data.satellites_visible = std::clamp(data.satellites_visible, 4, 12);
             
             data.timestamp = std::chrono::system_clock::now();
 
             std::stringstream ss;
             ss << "Generated GNSS data: " << data.toString() 
-               << "\nSignal quality - HDOP: " << data.hdop 
-               << ", Satellites: " << data.satellites_visible;
+               << "\nInterference level: " << signal_quality_.interference_level
+               << "\nTime varying factor: " << signal_quality_.time_varying_factor;
             Logger::log(Logger::DEBUG, ss.str());
 
             return data;
@@ -646,6 +701,7 @@ public:
         }
     }
 
+    // Метод для ручного обновления уровня помех
     void updateSignalQuality(double interference) {
         std::lock_guard<std::mutex> lock(gnss_mutex_);
         signal_quality_.interference_level = std::clamp(interference, 0.0, 1.0);
@@ -840,17 +896,18 @@ public:
                           gnss_data.position.longitude,
                           gnss_data.position.altitude;
             
-            // Матрица измерений (связывает состояние с измерениями)
+            // Матрица измерений
             Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, STATE_SIZE);
             H.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
             
-            // Обновление фильтра Калмана
+            // Обновляем фильтр Калмана
             kf_.update(measurement, H);
 
-            // Оценка качества сигнала и выбор режима интеграции
-            evaluateGNSSQuality(gnss_data);
-
-            Logger::log(Logger::DEBUG, "Processed GNSS data: " + gnss_data.toString());
+            std::stringstream ss;
+            ss << "Processed GNSS data: " << gnss_data.toString()
+               << "\nHDOP: " << gnss_data.hdop
+               << "\nSatellites: " << gnss_data.satellites_visible;
+            Logger::log(Logger::DEBUG, ss.str());
         }
         catch (const std::exception& e) {
             Logger::log(Logger::ERROR, "Error processing GNSS data: " + std::string(e.what()));
@@ -876,7 +933,8 @@ public:
         
         Position current_position = uav_.getPosition();
         double deviation = route_manager_.calculateRouteDeviation(current_position);
-        
+        double current_speed = uav_.getCurrentSpeedKmh(); 
+
         // Проверка актуальности ГНСС данных
         bool gnss_available = (std::chrono::system_clock::now() - last_gnss_update_) < gnss_timeout_;
         
@@ -888,7 +946,8 @@ public:
             last_gnss_data_.hdop,
             last_gnss_data_.satellites_visible,
             static_cast<int>(route_manager_.getCurrentWaypointIndex()),
-            route_manager_.getDistanceToNextWaypoint(current_position)
+            route_manager_.getDistanceToNextWaypoint(current_position),
+            current_speed 
         };
     }
 
