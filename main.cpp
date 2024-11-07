@@ -13,6 +13,7 @@
 #include <optional>
 #include <ctime>
 #include <algorithm> 
+#include "data_logger.hpp"
 
 // Константы
 constexpr double EARTH_RADIUS = 6378137.0; // метры
@@ -813,24 +814,114 @@ private:
     UAVModel uav_;
     INS ins_;
     GNSS gnss_;
-    KalmanFilter kf_;
+    KalmanFilter kf_loose_;  // Фильтр для слабосвязанной интеграции
+    KalmanFilter kf_tight_;  // Фильтр для тесносвязанной интеграции
     RouteManager route_manager_;
+    
+    Position ins_position_;
+    Position gnss_position_;
+    Position loose_position_;
+    Position tight_position_;
+    Position hybrid_position_;
     
     bool use_tight_coupling_;
     mutable std::mutex integration_mutex_;
     GNSSData last_gnss_data_;
+    IMUData last_imu_data_;
     
     double ins_error_;
     double gnss_error_;
     std::chrono::system_clock::time_point last_gnss_update_;
     const std::chrono::seconds gnss_timeout_{3}; // Таймаут ГНСС
     
+    // Параметры интеграции
+    double gnss_weight_;         // Вес ГНСС данных в гибридном решении
+    double tight_loose_ratio_;   // Соотношение тесной/слабой связи
+    
+    // Обновление позиции в слабосвязанном режиме
+    void updateLooseCoupling(const GNSSData& gnss_data, const IMUData& imu_data, double dt) {
+        // Прогноз по данным ИНС
+        Eigen::VectorXd ins_state = Eigen::VectorXd::Zero(STATE_SIZE);
+        ins_state.segment<3>(0) << ins_position_.latitude, 
+                                  ins_position_.longitude, 
+                                  ins_position_.altitude;
+        
+        // Обновление по данным ГНСС
+        if(gnss_data.hdop < 5.0 && gnss_data.satellites_visible >= 4) {
+            Eigen::VectorXd gnss_meas(3);
+            gnss_meas << gnss_data.position.latitude,
+                        gnss_data.position.longitude,
+                        gnss_data.position.altitude;
+            
+            Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, STATE_SIZE);
+            H.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
+            
+            kf_loose_.update(gnss_meas, H);
+        }
+        
+        // Получение результата
+        loose_position_ = Position(
+            kf_loose_.getPosition().latitude,
+            kf_loose_.getPosition().longitude,
+            kf_loose_.getPosition().altitude
+        );
+    }
+    
+    // Обновление позиции в тесносвязанном режиме
+    void updateTightCoupling(const GNSSData& gnss_data, const IMUData& imu_data, double dt) {
+        // Расширенный вектор измерений
+        Eigen::VectorXd meas = Eigen::VectorXd::Zero(MEASUREMENT_SIZE);
+        meas.segment<3>(0) << gnss_data.position.latitude,
+                             gnss_data.position.longitude,
+                             gnss_data.position.altitude;
+        meas.segment<3>(3) = imu_data.acceleration;
+        
+        // Расширенная матрица измерений
+        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(MEASUREMENT_SIZE, STATE_SIZE);
+        H.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
+        H.block<3,3>(3,6) = Eigen::Matrix3d::Identity();
+        
+        kf_tight_.update(meas, H);
+        
+        tight_position_ = Position(
+            kf_tight_.getPosition().latitude,
+            kf_tight_.getPosition().longitude,
+            kf_tight_.getPosition().altitude
+        );
+    }
+    
+    // Вычисление гибридного решения
+    void computeHybridSolution() {
+        // Адаптивное взвешивание на основе качества ГНСС
+        double gnss_quality = 1.0 / last_gnss_data_.hdop * 
+                            last_gnss_data_.satellites_visible / 12.0;
+        gnss_weight_ = std::clamp(gnss_quality, 0.1, 0.9);
+        
+        // Определение соотношения тесной/слабой связи
+        tight_loose_ratio_ = use_tight_coupling_ ? 0.7 : 0.3;
+        
+        // Вычисление взвешенных координат
+        hybrid_position_.latitude = 
+            tight_position_.latitude * tight_loose_ratio_ +
+            loose_position_.latitude * (1.0 - tight_loose_ratio_);
+            
+        hybrid_position_.longitude = 
+            tight_position_.longitude * tight_loose_ratio_ +
+            loose_position_.longitude * (1.0 - tight_loose_ratio_);
+            
+        hybrid_position_.altitude = 
+            tight_position_.altitude * tight_loose_ratio_ +
+            loose_position_.altitude * (1.0 - tight_loose_ratio_);
+    }
+
 public:
     HybridNavigationSystem() 
         : use_tight_coupling_(false)
         , ins_error_(0.0)
         , gnss_error_(0.0)
         , last_gnss_update_(std::chrono::system_clock::now())
+        , gnss_weight_(0.5)
+        , tight_loose_ratio_(0.5)
     {
         Logger::log(Logger::INFO, "Hybrid navigation system initialized");
     }
@@ -845,7 +936,17 @@ public:
             Position initial_position = route_manager_.getTargetPosition();
             uav_.setPosition(initial_position);
             ins_.setInitialPosition(initial_position);
-            kf_.setState(initial_position, Eigen::Vector3d::Zero());
+            
+            // Инициализация фильтров
+            kf_loose_.setState(initial_position, Eigen::Vector3d::Zero());
+            kf_tight_.setState(initial_position, Eigen::Vector3d::Zero());
+            
+            // Инициализация позиций
+            ins_position_ = initial_position;
+            gnss_position_ = initial_position;
+            loose_position_ = initial_position;
+            tight_position_ = initial_position;
+            hybrid_position_ = initial_position;
 
             Logger::log(Logger::INFO, "Navigation system initialized with position: " + 
                        initial_position.toString());
@@ -862,15 +963,26 @@ public:
         std::lock_guard<std::mutex> lock(integration_mutex_);
         
         try {
+            last_imu_data_ = imu_data;
+            
             // Обновление ИНС
             ins_.updatePosition(imu_data, dt);
+            ins_position_ = ins_.getEstimatedPosition();
             
-            // Прогноз в фильтре Калмана
-            kf_.predict(dt);
-
+            // Прогноз в фильтрах Калмана
+            kf_loose_.predict(dt);
+            kf_tight_.predict(dt);
+            
             // Обновление позиции БПЛА
             Position target = route_manager_.getTargetPosition();
             uav_.updateState(dt, target);
+
+            // Обновление интегрированных решений
+            updateLooseCoupling(last_gnss_data_, imu_data, dt);
+            if (use_tight_coupling_) {
+                updateTightCoupling(last_gnss_data_, imu_data, dt);
+            }
+            computeHybridSolution();
 
             // Проверка достижения точек маршрута
             route_manager_.updateWaypointProgress(uav_.getPosition());
@@ -889,19 +1001,10 @@ public:
         try {
             last_gnss_data_ = gnss_data;
             last_gnss_update_ = std::chrono::system_clock::now();
+            gnss_position_ = gnss_data.position;
 
-            // Подготовка измерений для фильтра Калмана
-            Eigen::VectorXd measurement(3);
-            measurement << gnss_data.position.latitude,
-                          gnss_data.position.longitude,
-                          gnss_data.position.altitude;
-            
-            // Матрица измерений
-            Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, STATE_SIZE);
-            H.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
-            
-            // Обновляем фильтр Калмана
-            kf_.update(measurement, H);
+            // Оценка качества ГНСС решения
+            evaluateGNSSQuality(gnss_data);
 
             std::stringstream ss;
             ss << "Processed GNSS data: " << gnss_data.toString()
@@ -928,42 +1031,63 @@ public:
         }
     }
     
+    LoggedData getLoggedData(const Position& pos) const {
+        LoggedData data;
+        data.position = PositionData(pos.latitude, pos.longitude, pos.altitude);
+        
+        NavigationState state = getState();
+        data.gnss_available = state.gnss_available;
+        data.hdop = state.hdop;
+        data.satellites_visible = state.satellites_visible;
+        data.deviation = state.deviation;
+        data.distance_to_next = state.distance_to_next;
+        data.current_waypoint = state.current_waypoint;
+        data.current_speed_kmh = state.current_speed_kmh;
+        data.is_running = state.is_running;
+        
+        if (last_imu_data_.timestamp != std::chrono::system_clock::time_point()) {
+            data.acceleration = last_imu_data_.acceleration;
+            data.angular_velocity = last_imu_data_.angular_velocity;
+        }
+        
+        return data;
+    }
+    
     NavigationState getState() const {
         std::lock_guard<std::mutex> lock(integration_mutex_);
         
         Position current_position = uav_.getPosition();
         double deviation = route_manager_.calculateRouteDeviation(current_position);
-        double current_speed = uav_.getCurrentSpeedKmh(); 
+        double current_speed = uav_.getCurrentSpeedKmh();
 
-        // Проверка актуальности ГНСС данных
         bool gnss_available = (std::chrono::system_clock::now() - last_gnss_update_) < gnss_timeout_;
         
         return NavigationState{
             current_position,
             deviation,
-            true,  // is_running
+            true,
             gnss_available,
             last_gnss_data_.hdop,
             last_gnss_data_.satellites_visible,
             static_cast<int>(route_manager_.getCurrentWaypointIndex()),
             route_manager_.getDistanceToNextWaypoint(current_position),
-            current_speed 
+            current_speed
         };
     }
-
+    
+    // Геттеры для всех вычисленных позиций
+    LoggedData getTrueData() const { return getLoggedData(uav_.getPosition()); }
+    LoggedData getINSData() const { return getLoggedData(ins_position_); }
+    LoggedData getGNSSData() const { return getLoggedData(gnss_position_); }
+    LoggedData getLooseData() const { return getLoggedData(loose_position_); }
+    LoggedData getTightData() const { return getLoggedData(tight_position_); }
+    LoggedData getHybridData() const { return getLoggedData(hybrid_position_); }
+    
     bool isRouteComplete() const {
         return route_manager_.isRouteComplete();
     }
 
-    Position getCurrentPosition() const {
-        std::lock_guard<std::mutex> lock(integration_mutex_);
-        return uav_.getPosition();
-    }
-
-    GNSSData getLastGNSSData() const {
-        std::lock_guard<std::mutex> lock(integration_mutex_);
-        return last_gnss_data_;
-    }
+    bool isTightCouplingActive() const { return use_tight_coupling_; }
 };
 
 // Класс симуляции навигации
@@ -971,6 +1095,7 @@ class NavigationSimulation {
 private:
     HybridNavigationSystem nav_system_;
     std::atomic<bool> running_;
+    NavigationDataLogger data_logger_;
     
     std::thread ins_thread_;
     std::thread gnss_thread_;
@@ -987,14 +1112,25 @@ private:
             auto start_time = std::chrono::steady_clock::now();
             
             try {
-                Position current_pos = nav_system_.getCurrentPosition();
-                Eigen::Vector3d velocity = Eigen::Vector3d::Zero(); // Заменить на реальную скорость
+                Position current_pos = nav_system_.getState().position;
+                Eigen::Vector3d velocity = Eigen::Vector3d::Zero(); // TODO: использовать реальную скорость
 
                 IMUData imu_data = generateIMUData(current_pos, velocity);
                 nav_system_.processINSData(imu_data, INS_UPDATE_INTERVAL.count() / 1000.0);
+                
+                // Логируем данные от всех навигационных подсистем
+                data_logger_.logNavigationData(
+                    nav_system_.getTrueData(),
+                    nav_system_.getINSData(),
+                    nav_system_.getGNSSData(),
+                    nav_system_.getLooseData(),
+                    nav_system_.getTightData(),
+                    nav_system_.getHybridData(),
+                    nav_system_.isTightCouplingActive()
+                );
             }
             catch (const std::exception& e) {
-                Logger::log(Logger::ERROR, std::string("Error in INS loop: ") + e.what());
+                Logger::log(Logger::ERROR, "Error in INS loop: " + std::string(e.what()));
             }
             
             std::this_thread::sleep_until(start_time + INS_UPDATE_INTERVAL);
@@ -1008,14 +1144,14 @@ private:
             auto start_time = std::chrono::steady_clock::now();
             
             try {
-                Position current_pos = nav_system_.getCurrentPosition();
-                Eigen::Vector3d velocity = Eigen::Vector3d::Zero(); // Заменить на реальную скорость
+                Position current_pos = nav_system_.getState().position;
+                Eigen::Vector3d velocity = Eigen::Vector3d::Zero(); // TODO: использовать реальную скорость
 
                 GNSSData gnss_data = generateGNSSData(current_pos, velocity);
                 nav_system_.processGNSSData(gnss_data);
             }
             catch (const std::exception& e) {
-                Logger::log(Logger::ERROR, std::string("Error in GNSS loop: ") + e.what());
+                Logger::log(Logger::ERROR, "Error in GNSS loop: " + std::string(e.what()));
             }
             
             std::this_thread::sleep_until(start_time + GNSS_UPDATE_INTERVAL);
@@ -1035,13 +1171,31 @@ private:
                 std::cout << "\033[2J\033[H";  // Очистка экрана
                 std::cout << "=== Navigation Status ===\n" << state.toString() << std::endl;
                 
+                // Дополнительный вывод точности разных подсистем
+                LoggedData true_data = nav_system_.getTrueData();
+                LoggedData ins_data = nav_system_.getINSData();
+                LoggedData gnss_data = nav_system_.getGNSSData();
+                LoggedData hybrid_data = nav_system_.getHybridData();
+
+                double ins_error = calculatePositionError(true_data.position, ins_data.position);
+                double gnss_error = calculatePositionError(true_data.position, gnss_data.position);
+                double hybrid_error = calculatePositionError(true_data.position, hybrid_data.position);
+
+                std::cout << "\nPosition Errors:\n"
+                         << "INS Error: " << std::fixed << std::setprecision(2) << ins_error << " m\n"
+                         << "GNSS Error: " << gnss_error << " m\n"
+                         << "Hybrid Error: " << hybrid_error << " m\n"
+                         << "Integration Mode: " << (nav_system_.isTightCouplingActive() ? 
+                                                   "Tight Coupling" : "Loose Coupling") 
+                         << std::endl;
+                
                 if (nav_system_.isRouteComplete()) {
                     Logger::log(Logger::INFO, "Route completed!");
                     running_ = false;
                 }
             }
             catch (const std::exception& e) {
-                Logger::log(Logger::ERROR, std::string("Error in deviation loop: ") + e.what());
+                Logger::log(Logger::ERROR, "Error in deviation loop: " + std::string(e.what()));
             }
             
             std::this_thread::sleep_until(start_time + DEVIATION_CHECK_INTERVAL);
@@ -1056,6 +1210,10 @@ private:
     GNSSData generateGNSSData(const Position& current_pos, const Eigen::Vector3d& velocity) {
         static GNSS gnss;
         return gnss.generateGNSSData(current_pos, velocity);
+    }
+
+    double calculatePositionError(const PositionData& true_pos, const PositionData& measured_pos) {
+        return true_pos.distanceTo(measured_pos);
     }
     
 public:
@@ -1079,7 +1237,7 @@ public:
             return true;
         }
         catch (const std::exception& e) {
-            Logger::log(Logger::ERROR, std::string("Error during initialization: ") + e.what());
+            Logger::log(Logger::ERROR, "Error during initialization: " + std::string(e.what()));
             return false;
         }
     }
@@ -1094,7 +1252,7 @@ public:
             deviation_thread_ = std::thread(&NavigationSimulation::deviationLoop, this);
         }
         catch (const std::exception& e) {
-            Logger::log(Logger::ERROR, std::string("Failed to start simulation threads: ") + e.what());
+            Logger::log(Logger::ERROR, "Failed to start simulation threads: " + std::string(e.what()));
             stop();
             throw;
         }
@@ -1107,6 +1265,47 @@ public:
         if (ins_thread_.joinable()) ins_thread_.join();
         if (gnss_thread_.joinable()) gnss_thread_.join();
         if (deviation_thread_.joinable()) deviation_thread_.join();
+        
+        try {
+            // Генерируем отчет
+            NavigationDataAnalyzer::generateReport(
+                data_logger_.getFilename(),
+                "navigation_report.txt"
+            );
+            
+            // Генерируем скрипт для построения графиков
+            NavigationDataAnalyzer::generateGnuplotScript(
+                data_logger_.getFilename()
+            );
+            
+            // Запускаем gnuplot для создания графиков
+            system("gnuplot plot_navigation.gnuplot");
+            
+            // Вывод итоговой статистики
+            NavigationState final_state = nav_system_.getState();
+            LoggedData true_final = nav_system_.getTrueData();
+            LoggedData ins_final = nav_system_.getINSData();
+            LoggedData gnss_final = nav_system_.getGNSSData();
+            LoggedData hybrid_final = nav_system_.getHybridData();
+            
+            std::stringstream ss;
+            ss << "\nFinal Navigation Statistics:"
+               << "\nFinal position: " << final_state.position.toString()
+               << "\nFinal errors:"
+               << "\n  INS: " << calculatePositionError(true_final.position, ins_final.position) << " m"
+               << "\n  GNSS: " << calculatePositionError(true_final.position, gnss_final.position) << " m"
+               << "\n  Hybrid: " << calculatePositionError(true_final.position, hybrid_final.position) << " m"
+               << "\nCompleted waypoints: " << final_state.current_waypoint
+               << "\nGNSS quality: " << (final_state.gnss_available ? "Good" : "Poor")
+               << " (Satellites: " << final_state.satellites_visible 
+               << ", HDOP: " << final_state.hdop << ")";
+            
+            std::cout << ss.str() << std::endl;
+            Logger::log(Logger::INFO, "Final statistics: " + ss.str());
+        }
+        catch (const std::exception& e) {
+            Logger::log(Logger::ERROR, "Error during simulation shutdown: " + std::string(e.what()));
+        }
         
         Logger::log(Logger::INFO, "Simulation stopped");
     }

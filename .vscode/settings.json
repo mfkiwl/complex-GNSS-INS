@@ -68,6 +68,9 @@
         "variant": "cpp",
         "format": "cpp",
         "semaphore": "cpp",
-        "core": "cpp"
+        "core": "cpp",
+        "list": "cpp",
+        "future": "cpp",
+        "cinttypes": "cpp"
     }
 }
