@@ -15,6 +15,7 @@
 #include <numeric>
 #include <cmath>
 #include <Eigen/Dense>
+#include "logger.hpp"
 
 // Структура для хранения позиционных данных
 struct PositionData {
@@ -150,6 +151,9 @@ private:
     std::thread writer_thread_;
     std::atomic<bool> running_;
     std::atomic<size_t> total_records_;
+
+    std::chrono::steady_clock::time_point last_write_time_;
+    const std::chrono::milliseconds WRITE_INTERVAL{1000}; // 1 Hz
     
     void writerLoop();
 

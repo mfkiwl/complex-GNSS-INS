@@ -71,6 +71,7 @@
         "core": "cpp",
         "list": "cpp",
         "future": "cpp",
-        "cinttypes": "cpp"
+        "cinttypes": "cpp",
+        "source_location": "cpp"
     }
 }

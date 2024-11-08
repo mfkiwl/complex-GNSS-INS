@@ -13,8 +13,8 @@ EIGEN_INCLUDE = -I/usr/include/eigen3
 INCLUDES = $(EIGEN_INCLUDE)
 
 # Source files
-SRCS = main.cpp data_logger.cpp
-HEADERS = data_logger.hpp
+SRCS = main.cpp data_logger.cpp logger.cpp
+HEADERS = data_logger.hpp logger.hpp
 
 # Object files
 OBJS = $(SRCS:.cpp=.o)

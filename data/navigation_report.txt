@@ -1,0 +1,50 @@
+=== Navigation System Performance Analysis ===
+Generated: 2024-11-08 11:56:46
+
+Total records analyzed: 0
+
+INS Performance:
+  Mean error: 0.00 m
+  Maximum error: 0.00 m
+  Standard deviation: 0.00 m
+  Reliability (<10m): 0.00%
+
+GNSS Performance:
+  Mean error: 0.00 m
+  Maximum error: 0.00 m
+  Standard deviation: 0.00 m
+  Reliability (<10m): 0.00%
+
+Loose Integration Performance:
+  Mean error: 0.00 m
+  Maximum error: 0.00 m
+  Standard deviation: 0.00 m
+  Reliability (<10m): 0.00%
+
+Tight Integration Performance:
+  Mean error: 0.00 m
+  Maximum error: 0.00 m
+  Standard deviation: 0.00 m
+  Reliability (<10m): 0.00%
+
+Hybrid Integration Performance:
+  Mean error: 0.00 m
+  Maximum error: 0.00 m
+  Standard deviation: 0.00 m
+  Reliability (<10m): 0.00%
+
+System Statistics:
+  GNSS Availability: 0.0%
+  Tight Coupling Usage: 0.0%
+  Average Route Deviation: 0.0 m
+  Maximum Route Deviation: 0.0 m
+  Average Speed: 0.0 km/h
+
+Comparative Analysis:
+  Best performing system: Tight Integration (mean error: 0.0 m)
+
+System Recommendations:
+  - Consider improving GNSS reception or antenna placement
+  - Review hybrid integration algorithm parameters
+
+Note: This report was generated from the data file: data/navigation_data.csv

@@ -14,6 +14,7 @@
 #include <ctime>
 #include <algorithm> 
 #include "data_logger.hpp"
+#include "logger.hpp"
 
 // Константы
 constexpr double EARTH_RADIUS = 6378137.0; // метры
@@ -21,77 +22,6 @@ constexpr double G = 9.80665; // м/с^2
 constexpr double PI = 3.14159265358979323846;
 constexpr int STATE_SIZE = 9;  // position(3) + velocity(3) + acceleration(3)
 constexpr int MEASUREMENT_SIZE = 6;  // position(3) + velocity(3)
-
-// Класс для логирования
-class Logger {
-private:
-    static std::ofstream log_file;
-    static std::mutex log_mutex;
-    static const char* log_filename;
-    static bool initialized;
-
-public:
-    enum Level {
-        DEBUG,
-        INFO,
-        ERROR
-    };
-
-    static bool init() {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        try {
-            if (!initialized) {
-                log_file.open(log_filename, std::ios::out | std::ios::trunc);
-                if (log_file.is_open()) {
-                    initialized = true;
-                    std::time_t now = std::time(nullptr);
-                    log_file << "=== Log started at " 
-                            << std::put_time(std::localtime(&now), "%Y-%m-%d %H:%M:%S")
-                            << " ===" << std::endl;
-                    return true;
-                }
-            }
-            return initialized;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Failed to initialize logger: " << e.what() << std::endl;
-            return false;
-        }
-    }
-
-    static void log(Level level, const std::string& message) {
-        if (!initialized) return;
-
-        std::lock_guard<std::mutex> lock(log_mutex);
-        auto now = std::chrono::system_clock::now();
-        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-        
-        log_file << std::put_time(std::localtime(&now_c), "%Y-%m-%d %H:%M:%S") 
-                << " [" << getLevelString(level) << "] " 
-                << message << std::endl;
-        log_file.flush();
-
-        // Дублируем важные сообщения в консоль
-        if (level == ERROR || level == INFO) {
-            std::cout << "[" << getLevelString(level) << "] " << message << std::endl;
-        }
-    }
-
-private:
-    static const char* getLevelString(Level level) {
-        switch (level) {
-            case DEBUG: return "DEBUG";
-            case INFO:  return "INFO";
-            case ERROR: return "ERROR";
-            default:    return "UNKNOWN";
-        }
-    }
-};
-
-std::ofstream Logger::log_file;
-std::mutex Logger::log_mutex;
-const char* Logger::log_filename = "navigation.log";
-bool Logger::initialized = false;
 
 // Базовые структуры данных
 struct Position {
@@ -1100,34 +1030,42 @@ private:
     std::thread ins_thread_;
     std::thread gnss_thread_;
     std::thread deviation_thread_;
+
+    std::chrono::steady_clock::time_point last_log_time_;
     
-    const std::chrono::milliseconds INS_UPDATE_INTERVAL{10};    // 100 Hz
-    const std::chrono::milliseconds GNSS_UPDATE_INTERVAL{1000}; // 1 Hz
-    const std::chrono::milliseconds DEVIATION_CHECK_INTERVAL{100}; // 10 Hz
-    
+    const std::chrono::milliseconds INS_UPDATE_INTERVAL{10};        // 100 Hz для вычислений
+    const std::chrono::milliseconds DATA_LOG_INTERVAL{1000};       // 1 Hz для логировани
+    const std::chrono::milliseconds GNSS_UPDATE_INTERVAL{1000};     // 1 Hz
+    const std::chrono::milliseconds DEVIATION_CHECK_INTERVAL{100};  // 10 Hz
+
     void insLoop() {
         Logger::log(Logger::INFO, "Starting INS loop");
+        last_log_time_ = std::chrono::steady_clock::now();
         
         while (running_) {
             auto start_time = std::chrono::steady_clock::now();
             
             try {
                 Position current_pos = nav_system_.getState().position;
-                Eigen::Vector3d velocity = Eigen::Vector3d::Zero(); // TODO: использовать реальную скорость
+                Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
 
                 IMUData imu_data = generateIMUData(current_pos, velocity);
                 nav_system_.processINSData(imu_data, INS_UPDATE_INTERVAL.count() / 1000.0);
                 
-                // Логируем данные от всех навигационных подсистем
-                data_logger_.logNavigationData(
-                    nav_system_.getTrueData(),
-                    nav_system_.getINSData(),
-                    nav_system_.getGNSSData(),
-                    nav_system_.getLooseData(),
-                    nav_system_.getTightData(),
-                    nav_system_.getHybridData(),
-                    nav_system_.isTightCouplingActive()
-                );
+                // Логируем данные только раз в секунду
+                auto current_time = std::chrono::steady_clock::now();
+                if (current_time - last_log_time_ >= DATA_LOG_INTERVAL) {
+                    data_logger_.logNavigationData(
+                        nav_system_.getTrueData(),
+                        nav_system_.getINSData(),
+                        nav_system_.getGNSSData(),
+                        nav_system_.getLooseData(),
+                        nav_system_.getTightData(),
+                        nav_system_.getHybridData(),
+                        nav_system_.isTightCouplingActive()
+                    );
+                    last_log_time_ = current_time;
+                }
             }
             catch (const std::exception& e) {
                 Logger::log(Logger::ERROR, "Error in INS loop: " + std::string(e.what()));
@@ -1259,56 +1197,88 @@ public:
     }
     
     void stop() {
-        Logger::log(Logger::INFO, "Stopping navigation simulation...");
-        running_ = false;
-        
-        if (ins_thread_.joinable()) ins_thread_.join();
-        if (gnss_thread_.joinable()) gnss_thread_.join();
-        if (deviation_thread_.joinable()) deviation_thread_.join();
-        
-        try {
-            // Генерируем отчет
-            NavigationDataAnalyzer::generateReport(
-                data_logger_.getFilename(),
-                "navigation_report.txt"
-            );
-            
-            // Генерируем скрипт для построения графиков
-            NavigationDataAnalyzer::generateGnuplotScript(
-                data_logger_.getFilename()
-            );
-            
-            // Запускаем gnuplot для создания графиков
-            system("gnuplot plot_navigation.gnuplot");
-            
-            // Вывод итоговой статистики
-            NavigationState final_state = nav_system_.getState();
-            LoggedData true_final = nav_system_.getTrueData();
-            LoggedData ins_final = nav_system_.getINSData();
-            LoggedData gnss_final = nav_system_.getGNSSData();
-            LoggedData hybrid_final = nav_system_.getHybridData();
-            
-            std::stringstream ss;
-            ss << "\nFinal Navigation Statistics:"
-               << "\nFinal position: " << final_state.position.toString()
-               << "\nFinal errors:"
-               << "\n  INS: " << calculatePositionError(true_final.position, ins_final.position) << " m"
-               << "\n  GNSS: " << calculatePositionError(true_final.position, gnss_final.position) << " m"
-               << "\n  Hybrid: " << calculatePositionError(true_final.position, hybrid_final.position) << " m"
-               << "\nCompleted waypoints: " << final_state.current_waypoint
-               << "\nGNSS quality: " << (final_state.gnss_available ? "Good" : "Poor")
-               << " (Satellites: " << final_state.satellites_visible 
-               << ", HDOP: " << final_state.hdop << ")";
-            
-            std::cout << ss.str() << std::endl;
-            Logger::log(Logger::INFO, "Final statistics: " + ss.str());
+    Logger::log(Logger::INFO, "Stopping navigation simulation...");
+    running_ = false;
+    
+    if (ins_thread_.joinable()) ins_thread_.join();
+    if (gnss_thread_.joinable()) gnss_thread_.join();
+    if (deviation_thread_.joinable()) deviation_thread_.join();
+    
+    try {
+        // Генерируем абсолютные пути
+        std::string data_dir = "data";
+        std::string csv_file = data_dir + "/navigation_data.csv";
+        std::string report_file = data_dir + "/navigation_report.txt";
+        std::string plot_script = data_dir + "/plot_navigation.gnuplot";
+
+        // Создаем отчет
+        Logger::log(Logger::INFO, "Generating report...");
+        NavigationDataAnalyzer::generateReport(csv_file, report_file);
+
+        // Генерируем скрипт для построения графиков
+        Logger::log(Logger::INFO, "Generating plot script...");
+        NavigationDataAnalyzer::generateGnuplotScript(csv_file);
+
+        // Проверяем наличие файлов
+        if (!std::ifstream(csv_file).good()) {
+            throw std::runtime_error("Data file not found: " + csv_file);
         }
-        catch (const std::exception& e) {
-            Logger::log(Logger::ERROR, "Error during simulation shutdown: " + std::string(e.what()));
+        if (!std::ifstream(plot_script).good()) {
+            throw std::runtime_error("Plot script not found: " + plot_script);
         }
+
+        // Запускаем gnuplot
+        Logger::log(Logger::INFO, "Running gnuplot...");
+        std::string gnuplot_cmd = "gnuplot " + plot_script;
         
-        Logger::log(Logger::INFO, "Simulation stopped");
+        Logger::log(Logger::INFO, "Executing command: " + gnuplot_cmd);
+        
+        FILE* pipe = popen(gnuplot_cmd.c_str(), "r");
+
+        // Читаем вывод gnuplot
+        char buffer[128];
+        std::string gnuplot_output = "";
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            gnuplot_output += buffer;
+        }
+
+        int status = pclose(pipe);
+        if (status != 0) {
+            Logger::log(Logger::ERROR, "Gnuplot error output: " + gnuplot_output);
+            throw std::runtime_error("Gnuplot execution failed");
+        }
+
+        Logger::log(Logger::INFO, "Plots generated successfully");
+        
+        // Вывод итоговой статистики...
+        NavigationState final_state = nav_system_.getState();
+        LoggedData true_final = nav_system_.getTrueData();
+        LoggedData ins_final = nav_system_.getINSData();
+        LoggedData gnss_final = nav_system_.getGNSSData();
+        LoggedData hybrid_final = nav_system_.getHybridData();
+        
+        std::stringstream ss;
+        ss << "\nFinal Navigation Statistics:"
+           << "\nFinal position: " << final_state.position.toString()
+           << "\nFinal errors:"
+           << "\n  INS: " << calculatePositionError(true_final.position, ins_final.position) << " m"
+           << "\n  GNSS: " << calculatePositionError(true_final.position, gnss_final.position) << " m"
+           << "\n  Hybrid: " << calculatePositionError(true_final.position, hybrid_final.position) << " m"
+           << "\nCompleted waypoints: " << final_state.current_waypoint
+           << "\nGNSS quality: " << (final_state.gnss_available ? "Good" : "Poor")
+           << " (Satellites: " << final_state.satellites_visible 
+           << ", HDOP: " << final_state.hdop << ")";
+        
+        std::cout << ss.str() << std::endl;
+        Logger::log(Logger::INFO, "Final statistics: " + ss.str());
     }
+     catch (const std::exception& e) {
+        Logger::log(Logger::ERROR, "Error during simulation shutdown: " + std::string(e.what()));
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+    
+    Logger::log(Logger::INFO, "Simulation stopped");
+}
     
     NavigationState getState() const {
         return nav_system_.getState();
