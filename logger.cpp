@@ -1,4 +1,7 @@
 #include "logger.hpp"
+#include <chrono>
+#include <ctime>
+#include <iomanip>
 
 std::ofstream Logger::log_file;
 std::mutex Logger::log_mutex;
@@ -35,8 +38,8 @@ void Logger::log(Level level, const std::string& message) {
     std::time_t now_c = std::chrono::system_clock::to_time_t(now);
     
     log_file << std::put_time(std::localtime(&now_c), "%Y-%m-%d %H:%M:%S") 
-            << " [" << getLevelString(level) << "] " 
-            << message << std::endl;
+             << " [" << getLevelString(level) << "] " 
+             << message << std::endl;
     log_file.flush();
 
     // Дублируем важные сообщения в консоль

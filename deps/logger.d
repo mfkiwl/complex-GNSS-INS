@@ -1,1 +1,6 @@
-logger.o: logger.cpp logger.hpp
+-Wall
+-Wextra
+-O3
+-march=native
+-MM
+logger.cpp

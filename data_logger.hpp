@@ -68,6 +68,11 @@ struct LoggedData {
     Eigen::Vector3d acceleration;
     Eigen::Vector3d angular_velocity;
     
+    // Параметры для методов интеграции
+    double ins_trust_weight;
+    double gnss_trust_weight;
+    double position_error;
+    
     LoggedData()
         : gnss_available(false)
         , hdop(0.0)
@@ -79,6 +84,9 @@ struct LoggedData {
         , is_running(false)
         , acceleration(Eigen::Vector3d::Zero())
         , angular_velocity(Eigen::Vector3d::Zero())
+        , ins_trust_weight(0.0)
+        , gnss_trust_weight(0.0)
+        , position_error(0.0)
     {}
 };
 
@@ -91,16 +99,18 @@ private:
         PositionData true_position;
         PositionData ins_position;
         PositionData gnss_position;
-        PositionData loose_position;
-        PositionData tight_position;
-        PositionData hybrid_position;
+        PositionData weighted_position;
+        PositionData position_based_position;
         
         // Ошибки позиционирования
         double ins_error;
         double gnss_error;
-        double loose_error;
-        double tight_error;
-        double hybrid_error;
+        double weighted_error;
+        double position_based_error;
+        
+        // Веса доверия
+        double ins_trust_weight;
+        double gnss_trust_weight;
         
         // Навигационные данные
         double deviation;
@@ -123,24 +133,8 @@ private:
         
         // Состояние системы
         bool is_running;
-        bool tight_coupling_active;
-        
-        std::string toCSVHeader() const {
-            return "Timestamp,"
-                   "True_Lat,True_Lon,True_Alt,"
-                   "INS_Lat,INS_Lon,INS_Alt,"
-                   "GNSS_Lat,GNSS_Lon,GNSS_Alt,"
-                   "Loose_Lat,Loose_Lon,Loose_Alt,"
-                   "Tight_Lat,Tight_Lon,Tight_Alt,"
-                   "Hybrid_Lat,Hybrid_Lon,Hybrid_Alt,"
-                   "INS_Error,GNSS_Error,Loose_Error,Tight_Error,Hybrid_Error,"
-                   "Route_Deviation,Distance_to_WP,Current_WP,Speed_KMH,"
-                   "GNSS_Available,HDOP,Satellites,"
-                   "Accel_X,Accel_Y,Accel_Z,"
-                   "AngVel_X,AngVel_Y,AngVel_Z,"
-                   "Is_Running,Tight_Coupling_Active";
-        }
-        
+
+        std::string toCSVHeader() const;
         std::string toCSVRow() const;
     };
 
@@ -161,13 +155,15 @@ public:
     NavigationDataLogger(const std::string& filename = "data/navigation_data.csv");
     ~NavigationDataLogger();
     
-    void logNavigationData(const LoggedData& true_data,
-                          const LoggedData& ins_data,
-                          const LoggedData& gnss_data,
-                          const LoggedData& loose_data,
-                          const LoggedData& tight_data,
-                          const LoggedData& hybrid_data,
-                          bool tight_coupling_active);
+    void logNavigationData(
+        const LoggedData& true_data,
+        const LoggedData& ins_data,
+        const LoggedData& gnss_data,
+        const LoggedData& weighted_data,
+        const LoggedData& position_based_data,
+        double ins_weight,
+        double gnss_weight
+    );
     
     size_t getTotalRecords() const { return total_records_; }
     std::string getFilename() const { return filename_; }
@@ -180,22 +176,44 @@ public:
         double max_error;
         double std_dev;
         double reliability_percent;
+        
+        SystemAccuracy()
+            : mean_error(0.0)
+            , max_error(0.0)
+            , std_dev(0.0)
+            , reliability_percent(0.0)
+        {}
     };
     
     struct AnalysisResult {
         SystemAccuracy ins_accuracy;
         SystemAccuracy gnss_accuracy;
-        SystemAccuracy loose_accuracy;
-        SystemAccuracy tight_accuracy;
-        SystemAccuracy hybrid_accuracy;
+        SystemAccuracy weighted_accuracy;
+        SystemAccuracy position_based_accuracy;
         double gnss_availability_percent;
-        double tight_coupling_usage_percent;
+        double average_ins_weight;
+        double average_gnss_weight;
         double average_deviation;
         double max_deviation;
         double average_speed;
         int total_records;
+        
+        AnalysisResult()
+            : gnss_availability_percent(0.0)
+            , average_ins_weight(0.0)
+            , average_gnss_weight(0.0)
+            , average_deviation(0.0)
+            , max_deviation(0.0)
+            , average_speed(0.0)
+            , total_records(0)
+        {}
     };
+
+private:
+    static std::string getCurrentTimeString();
+    static SystemAccuracy calculateAccuracy(const std::vector<double>& errors);
     
+public:
     static AnalysisResult analyzeData(const std::string& csv_filename);
     static void generateReport(const std::string& csv_filename, 
                              const std::string& report_filename);

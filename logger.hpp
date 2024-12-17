@@ -4,17 +4,9 @@
 #include <iostream>
 #include <fstream>
 #include <mutex>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
+#include <string>
 
 class Logger {
-private:
-    static std::ofstream log_file;
-    static std::mutex log_mutex;
-    static const char* log_filename;
-    static bool initialized;
-
 public:
     enum Level {
         DEBUG,
@@ -27,6 +19,11 @@ public:
     static void log(Level level, const std::string& message);
 
 private:
+    static std::ofstream log_file;
+    static std::mutex log_mutex;
+    static const char* log_filename;
+    static bool initialized;
+    
     static const char* getLevelString(Level level);
 };
 

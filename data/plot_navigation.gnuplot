@@ -1,53 +1,58 @@
-# Gnuplot script for navigation data visualization
-# Data file: data/navigation_data.csv
-# Generated: 2024-11-08 11:56:46
-
-# Global settings
-set terminal png size 1200,800 enhanced font 'Arial,12'
+set terminal png size 1600,1000
 set grid
 set datafile separator ','
+# Пропускаем первую строку с заголовками
+set datafile missing 'NaN'
 set key outside right
-set style line 1 lc rgb '#0060ad' lt 1 lw 2
-set style line 2 lc rgb '#dd181f' lt 1 lw 2
-set style line 3 lc rgb '#00cc00' lt 1 lw 2
-set style line 4 lc rgb '#ff8c00' lt 1 lw 2
-set style line 5 lc rgb '#9400d3' lt 1 lw 2
 
-# Position errors plot
-set output 'data/position_errors.png'
-set title 'Position Errors Over Time' font 'Arial,14'
-set xlabel 'Record Number'
-set ylabel 'Error (meters)'
-plot 'data/navigation_data.csv' using 0:20 title 'INS' ls 1 with lines,\
-     '' using 0:21 title 'GNSS' ls 2 with lines,\
-     '' using 0:22 title 'Loose Integration' ls 3 with lines,\
-     '' using 0:23 title 'Tight Integration' ls 4 with lines,\
-     '' using 0:24 title 'Hybrid Integration' ls 5 with lines
+# Устанавливаем формат данных
+set decimal locale
+set format y '%g'
 
-# Trajectory plot
+set output 'data/altitude_profile.png'
+set title 'Профиль высоты'
+set xlabel 'Время (с)'
+set ylabel 'Высота (м)'
+set yrange [190:310]
+# Используем every для уменьшения шума на графике
+plot 'data/navigation_data.csv' every ::1 using 0:3 title 'Истинная' with lines,\
+     '' every ::1 using 0:6 title 'ИНС' with lines,\
+     '' every ::1 using 0:9 title 'ГНСС' with lines
+
 set output 'data/trajectory.png'
-set title 'Flight Trajectory' font 'Arial,14'
-set xlabel 'Longitude'
-set ylabel 'Latitude'
-plot 'data/navigation_data.csv' using 3:2 title 'True' ls 1 with lines,\
-     '' using 6:5 title 'INS' ls 2 with lines,\
-     '' using 9:8 title 'GNSS' ls 3 with lines,\
-     '' using 12:11 title 'Loose' ls 4 with lines,\
-     '' using 15:14 title 'Tight' ls 5 with lines
+set title 'Траектория полета'
+set xlabel 'Долгота'
+set ylabel 'Широта'
+set size ratio -1
+plot 'data/navigation_data.csv' every ::1 using 2:1 title 'Истинная' with lines,\
+     '' every ::1 using 5:4 title 'ИНС' with lines,\
+     '' every ::1 using 8:7 title 'ГНСС' with lines,\
+     '' every ::1 using 11:10 title 'Весовая интеграция' with lines,\
+     '' every ::1 using 14:13 title 'Поз./скор. интеграция' with lines
 
-# Altitude plot
-set output 'data/altitude.png'
-set title 'Altitude Profile' font 'Arial,14'
-set xlabel 'Record Number'
-set ylabel 'Altitude (meters)'
-plot 'data/navigation_data.csv' using 0:4 title 'True' ls 1 with lines,\
-     '' using 0:7 title 'INS' ls 2 with lines,\
-     '' using 0:10 title 'GNSS' ls 3 with lines
+set output 'data/gnss_quality.png'
+set title 'Качество сигнала ГНСС'
+set xlabel 'Время (с)'
+set ylabel 'HDOP'
+set y2label 'Количество спутников'
+set ytics nomirror
+set y2tics
+set yrange [0:*]
+set y2range [0:15]
+plot 'data/navigation_data.csv' every ::1 using 0:28 title 'HDOP' with lines axis x1y1,\
+     '' every ::1 using 0:29 title 'Спутники' with lines axis x1y2
 
-# Route deviation plot
-set output 'data/deviation.png'
-set title 'Route Deviation' font 'Arial,14'
-set xlabel 'Record Number'
-set ylabel 'Deviation (meters)'
-plot 'data/navigation_data.csv' using 0:25 title 'Deviation' ls 1 with lines
+set output 'data/ekf_convergence.png'
+set title 'Сходимость оценок EKF'
+set xlabel 'Время (с)'
+set ylabel 'Ошибка (м)'
+# Вычисляем ошибку как расстояние между истинным и оцененным положением
+plot 'data/navigation_data.csv' every ::1 using 0:(sqrt(($2-$14)*($2-$14) + ($1-$13)*($1-$13))) title 'Ошибка EKF' with lines
 
+set output 'data/ekf_innovation_sequence.png'
+set title 'Инновационная последовательность EKF'
+set xlabel 'Время (с)'
+set ylabel 'Невязка (м)'
+# Вычисляем невязки как разность между измерениями ГНСС и оценками EKF
+plot 'data/navigation_data.csv' every ::1 using 0:($8-$14) title 'Невязка по широте' with lines,\
+     '' every ::1 using 0:($7-$13) title 'Невязка по долготе' with lines
