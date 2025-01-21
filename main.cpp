@@ -663,54 +663,83 @@ private:
     double position_error_stddev_;
     mutable std::mutex gnss_mutex_;
     
-    struct SignalQuality {
-        double base_hdop;
-        int base_satellites;
-        double interference_level;
-        double time_varying_factor;
+      struct SignalQuality {
+        double hdop;                    // Геометрический фактор
+        int satellites;                 // Количество видимых спутников
+        double position_accuracy;       // Точность определения положения (метры)
+        double velocity_accuracy;       // Точность определения скорости (м/с)
+        double vertical_accuracy;       // Точность определения высоты (метры)
+        double interference_level;      // Уровень помех (от 0 до 1)
         
         SignalQuality() 
-            : base_hdop(1.0)    // Минимальный HDOP
-            , base_satellites(12)
-            , interference_level(0.0)
-            , time_varying_factor(0.0) {}
+            : hdop(1.0)
+            , satellites(12)
+            , position_accuracy(2.5)    // Базовая точность позиционирования
+            , velocity_accuracy(0.1)    // Базовая точность определения скорости
+            , vertical_accuracy(5.0)    // Базовая точность определения высоты
+            , interference_level(0.0)   // Начальный уровень помех
+        {}
     } signal_quality_;
 
-    void updateSignalQuality() {
-    // Генерируем случайное количество спутников от 4 до 12
-    std::uniform_int_distribution<> sat_dist(4, 12);
-    signal_quality_.base_satellites = sat_dist(gen_);
-    
-    // HDOP зависит от количества спутников нелинейно
-    double base_hdop;
-    if (signal_quality_.base_satellites >= 10) {
-        std::uniform_real_distribution<> hdop_dist(1.0, 1.5);
-        base_hdop = hdop_dist(gen_);
-    } 
-    else if (signal_quality_.base_satellites >= 7) {
-        std::uniform_real_distribution<> hdop_dist(1.5, 2.5);
-        base_hdop = hdop_dist(gen_);
-    }
-    else {
-        std::uniform_real_distribution<> hdop_dist(2.5, 4.0);
-        base_hdop = hdop_dist(gen_);
+     void updateSignalQuality() {
+        // Учитываем влияние помех на количество видимых спутников
+        int base_satellites = 12;
+        signal_quality_.satellites = static_cast<int>(
+            base_satellites * (1.0 - 0.6 * signal_quality_.interference_level)
+        );
+        signal_quality_.satellites = std::clamp(signal_quality_.satellites, 4, 12);
+
+        // Обновляем HDOP с учетом помех
+        double base_hdop;
+        if (signal_quality_.satellites >= 10) {
+            std::uniform_real_distribution<> hdop_dist(1.0, 1.5);
+            base_hdop = hdop_dist(gen_);
+        } 
+        else if (signal_quality_.satellites >= 7) {
+            std::uniform_real_distribution<> hdop_dist(1.5, 2.5);
+            base_hdop = hdop_dist(gen_);
+        }
+        else {
+            std::uniform_real_distribution<> hdop_dist(2.5, 4.0);
+            base_hdop = hdop_dist(gen_);
+        }
+
+        // Увеличиваем HDOP при наличии помех
+        signal_quality_.hdop = base_hdop * (1.0 + signal_quality_.interference_level);
+        signal_quality_.hdop = std::min(signal_quality_.hdop, 4.0);  // Ограничиваем максимальное значение
+
+        // Пересчитываем точности измерений с учетом помех и текущего состояния
+        double quality_factor = (signal_quality_.satellites / 12.0) * 
+                              (1.0 / signal_quality_.hdop) * 
+                              (1.0 - signal_quality_.interference_level);
+        
+        // Обновляем точности всех измерений
+        signal_quality_.position_accuracy = 2.5 / quality_factor;  // Базовая точность 2.5м
+        signal_quality_.velocity_accuracy = 0.1 / quality_factor;  // Базовая точность 0.1 м/с
+        signal_quality_.vertical_accuracy = 5.0 / quality_factor;  // Базовая точность 5м
+
+        Logger::log(Logger::DEBUG, 
+            "GNSS quality updated - Sats: " + std::to_string(signal_quality_.satellites) + 
+            ", HDOP: " + std::to_string(signal_quality_.hdop) + 
+            ", Interference: " + std::to_string(signal_quality_.interference_level));
     }
 
-    // Добавляем случайные вариации к HDOP
-    double hdop_variation = noise_dist_(gen_) * 0.2;  // +/- 20% вариации
-    signal_quality_.base_hdop = base_hdop * (1.0 + hdop_variation);
+
+    void monitorErrors(const Position& true_position, const GNSSData& data) {
+    double position_error = RouteManager::calculateDistance(true_position, data.position);
+    double height_error = std::abs(true_position.altitude - data.position.altitude);
     
-    // Уровень интерференции зависит от обоих факторов
-    signal_quality_.interference_level = ((12 - signal_quality_.base_satellites) / 8.0 + 
-                                        (signal_quality_.base_hdop - 0.8) / 3.2) / 2.0;
-    signal_quality_.interference_level = std::clamp(signal_quality_.interference_level, 0.0, 1.0);
+    if (position_error > 50.0 || height_error > 20.0) {
+        Logger::log(Logger::WARNING, 
+            "Large GNSS error detected - Position: " + std::to_string(position_error) + 
+            "m, Height: " + std::to_string(height_error) + "m");
+    }
 }
+
 
 public:
     GNSS() 
         : gen_(rd_())
-        , noise_dist_(0.0, 0.01)
-        , position_error_stddev_(0.1)
     {
         Logger::log(Logger::INFO, "GNSS initialized");
     }
@@ -718,93 +747,268 @@ public:
 GNSSData generateGNSSData(const Position& true_position, const Eigen::Vector3d& true_velocity) {
     std::lock_guard<std::mutex> lock(gnss_mutex_);
     
-    try {
+  try {
         updateSignalQuality();
         GNSSData data;
         
-        // Ошибка позиции зависит от HDOP и количества спутников
-        double accuracy_factor = signal_quality_.base_satellites / 12.0; // от 0.33 до 1.0
-        double base_error = 0.00001 / accuracy_factor;
-        
-        // Добавляем ошибку с учетом HDOP
-        data.position.latitude = true_position.latitude + noise_dist_(gen_) * base_error * signal_quality_.base_hdop;
-        data.position.longitude = true_position.longitude + noise_dist_(gen_) * base_error * signal_quality_.base_hdop;
-        data.position.altitude = true_position.altitude + noise_dist_(gen_) * 0.1 * signal_quality_.base_hdop;
+        Logger::log(Logger::DEBUG, "GNSS input - True altitude: " + 
+            std::to_string(true_position.altitude));
 
-        // Скорость также зависит от точности ГНСС
+        // Копируем истинную позицию
+        data.position = true_position;
+        
+        // Добавляем шум к координатам с учетом текущего HDOP
+        std::normal_distribution<> pos_noise(0.0, 0.00001 * signal_quality_.hdop);
+        data.position.latitude += pos_noise(gen_);
+        data.position.longitude += pos_noise(gen_);
+        data.position.altitude += pos_noise(gen_);
+
+        // Вычисляем и проверяем фактическую ошибку высоты
+        double actual_height_error = data.position.altitude - true_position.altitude;
+        
+        // Обрабатываем скорость
+        data.velocity = true_velocity;
+        std::normal_distribution<> vel_noise(0.0, 0.1);
         for(int i = 0; i < 3; ++i) {
-            data.velocity(i) = true_velocity(i) + noise_dist_(gen_) * 0.1 * signal_quality_.base_hdop;
+            data.velocity(i) += vel_noise(gen_);
         }
 
-        data.hdop = signal_quality_.base_hdop;
-        data.satellites_visible = signal_quality_.base_satellites;
+        // Копируем текущие параметры качества сигнала
+        data.hdop = signal_quality_.hdop;
+        data.satellites_visible = signal_quality_.satellites;
         data.timestamp = std::chrono::system_clock::now();
 
         return data;
     }
-    catch (const std::exception& e) {
-        Logger::log(Logger::ERROR, "Error generating GNSS data: " + std::string(e.what()));
-        throw;
+        catch (const std::exception& e) {
+            Logger::log(Logger::ERROR, "Error generating GNSS data: " + std::string(e.what()));
+            throw;
+        }
     }
-}
-    void updateSignalQuality(double interference) {
+     void updateSignalQuality(double interference) {
         std::lock_guard<std::mutex> lock(gnss_mutex_);
         signal_quality_.interference_level = std::clamp(interference, 0.0, 1.0);
-        Logger::log(Logger::INFO, "GNSS signal quality updated, interference level: " + 
-                   std::to_string(interference));
+        updateSignalQuality();  // Обновляем все параметры с учетом нового уровня помех
+        
+        Logger::log(Logger::INFO, 
+            "GNSS interference level updated to: " + std::to_string(interference));
     }
 };
 
 // Класс расширенного фильтра Калмана (EKF)
 class ExtendedKalmanFilter {
 private:
+    static const int STATE_SIZE = 7;    // [lat, lon, alt, vn, ve, vh, drift]
+    static const int MEAS_SIZE = 6;     // [lat, lon, alt, vn, ve, vh]
+    
     Eigen::VectorXd state_;            // Вектор состояния
     Eigen::MatrixXd covariance_;       // Матрица ковариации
     Eigen::MatrixXd process_noise_;    // Шум процесса
     bool is_initialized_;
 
-public:
-    static const int STATE_SIZE = 4;    // [lat, lon, vx, vy]
-    static const int MEAS_SIZE = 4;     // [lat, lon, vx, vy]
+    Eigen::VectorXd latest_innovation_;
+    double latest_nis_;
+    double latest_nees_;
+    double current_scale_;
+    
+    // Константы для модели
+    const double EARTH_RADIUS = 6378137.0;  // радиус Земли (м)
+    const double G = 9.80665;               // ускорение свободного падения (м/с²)
+    
+    // Параметры адаптивной фильтрации
+    double innovation_covariance_estimate_;
+    const double ADAPTIVE_WINDOW_SIZE = 10;
+    std::deque<Eigen::VectorXd> innovation_history_;
+    
+    // Нелинейная функция прогноза состояния
+    Eigen::VectorXd nonlinearStatePredict(
+    const Eigen::VectorXd& state,
+    const Eigen::Vector3d& acceleration,
+    const Eigen::Vector3d& angular_velocity,
+    double dt)
+    {
+        Eigen::VectorXd predicted = Eigen::VectorXd::Zero(STATE_SIZE);
+        
+        // Извлекаем текущие значения
+        double lat = state(0);
+        double lon = state(1);
+        double alt = state(2);
+        double vn = state(3);
+        double ve = state(4);
+        double vh = state(5);
+        double drift = state(6);
+        
+         // Используем данные акселерометров для обновления скоростей
+        double dvn = acceleration.x() * dt;
+        double dve = acceleration.y() * dt;
+        double dvh = (acceleration.z() - G) * dt;
 
+        // Вычисляем метрические коэффициенты
+        double R_lat = EARTH_RADIUS + alt;
+        double R_lon = (EARTH_RADIUS + alt) * cos(lat * M_PI / 180.0);
+        
+        // Прогноз позиции
+     predicted(0) = lat + (vn + 0.5 * dvn * dt) / R_lat * (180.0 / M_PI) * dt;
+    predicted(1) = lon + (ve + 0.5 * dve * dt) / R_lon * (180.0 / M_PI) * dt;
+    predicted(2) = alt + (vh + 0.5 * dvh * dt) * dt;
+    
+    // Обновляем скорости
+        predicted(3) = vn + dvn + drift * dt;  // north velocity
+        predicted(4) = ve + dve + drift * dt;  // east velocity
+        predicted(5) = vh + dvh + drift * dt;  // vertical velocity
+    
+    // Обновляем дрейф
+    predicted(6) = drift;
+    
+    return predicted;
+    }
+    
+    // Вычисление матрицы Якоби для функции прогноза
+        Eigen::MatrixXd calculateJacobian(
+        const Eigen::VectorXd& state,
+        const Eigen::Vector3d& acceleration,
+        double dt) 
+    {
+        Eigen::MatrixXd F = Eigen::MatrixXd::Identity(STATE_SIZE, STATE_SIZE);
+        
+        // Extract current state values
+        double lat = state(0);
+        double alt = state(2);
+        double vn = state(3);
+        double ve = state(4);
+        
+        // Расчет метрических коэффициентов
+        double R_lat = EARTH_RADIUS + alt;
+        double R_lon = (EARTH_RADIUS + alt) * cos(lat * M_PI / 180.0);
+        
+        // Позиционные деривативы
+        F(0, 2) = -vn / (R_lat * R_lat) * (180.0 / M_PI) * dt;
+        F(0, 3) = 1.0 / R_lat * (180.0 / M_PI) * dt;
+        
+        F(1, 0) = -ve * sin(lat * M_PI / 180.0) / (R_lon * cos(lat * M_PI / 180.0)) * (180.0 / M_PI) * dt;
+        F(1, 2) = -ve / (R_lon * R_lon) * (180.0 / M_PI) * dt;
+        F(1, 4) = 1.0 / R_lon * (180.0 / M_PI) * dt;
+        
+        // Скоростные деривативы
+        F(3, 6) = dt;  // Влияние дрейфа на серверную компоненту скорости
+        F(4, 6) = dt;  // // Влияние дрейфа на восточную компоненту скорости
+        F(5, 6) = dt;  //  Влияние дрейфа на вертикальную компоненту скорост
+        
+        return F;
+    }
+    
+    // Адаптивная настройка матрицы шумов процесса
+    void adaptProcessNoise(const Eigen::VectorXd& innovation) {
+        // Сохраняем историю инноваций
+        innovation_history_.push_back(innovation);
+        if (innovation_history_.size() > ADAPTIVE_WINDOW_SIZE) {
+            innovation_history_.pop_front();
+        }
+        
+        if (innovation_history_.size() >= ADAPTIVE_WINDOW_SIZE) {
+            // Оцениваем ковариацию инноваций
+            Eigen::VectorXd mean_innovation = Eigen::VectorXd::Zero(MEAS_SIZE);
+            for (const auto& inn : innovation_history_) {
+                mean_innovation += inn;
+            }
+            mean_innovation /= innovation_history_.size();
+            
+            Eigen::MatrixXd innovation_cov = Eigen::MatrixXd::Zero(MEAS_SIZE, MEAS_SIZE);
+            for (const auto& inn : innovation_history_) {
+                Eigen::VectorXd centered = inn - mean_innovation;
+                innovation_cov += centered * centered.transpose();
+            }
+            innovation_cov /= (innovation_history_.size() - 1);
+            
+            // Адаптивно корректируем шум процесса
+            double trace_innovation = innovation_cov.trace();
+            current_scale_  = std::max(1.0, trace_innovation / innovation_covariance_estimate_);
+            process_noise_ *= current_scale_;
+            
+            // Обновляем оценку ковариации инноваций
+            innovation_covariance_estimate_ = trace_innovation;
+        }
+    }
+
+public:
     ExtendedKalmanFilter() 
         : is_initialized_(false)
+        , innovation_covariance_estimate_(1.0)
+        , latest_innovation_(Eigen::VectorXd::Zero(MEAS_SIZE))
+        , latest_nis_(0.0)
+        , latest_nees_(0.0)
+        , current_scale_(1.0)
     {
         state_ = Eigen::VectorXd::Zero(STATE_SIZE);
         covariance_ = Eigen::MatrixXd::Identity(STATE_SIZE, STATE_SIZE);
         process_noise_ = Eigen::MatrixXd::Identity(STATE_SIZE, STATE_SIZE);
         
-        covariance_ *= 0.1;
-        process_noise_.topLeftCorner(2, 2) *= 0.00001;  // Для позиции
-        process_noise_.bottomRightCorner(2, 2) *= 0.01; // Для скорости
+        // Инициализация матрицы ковариации с разными значениями для разных компонент
+        covariance_.topLeftCorner(3,3) *= 1e-10;     // Позиция (рад²)
+        covariance_.block(3,3,3,3) *= 0.01;          // Скорость (м²/с²)
+        covariance_(6,6) = 0.0001;                   // Дрейф (м²/с⁴)
+        
+        // Инициализация матрицы шумов процесса
+        process_noise_.topLeftCorner(3,3) *= 1e-12;  // Позиция
+        process_noise_.block(3,3,3,3) *= 0.001;      // Скорость
+        process_noise_(6,6) = 1e-6;                  // Дрейф
     }
-
+    
     void setState(const Position& pos, const Eigen::Vector3d& vel) {
-        state_ = Eigen::VectorXd::Zero(STATE_SIZE);
         state_(0) = pos.latitude;
         state_(1) = pos.longitude;
-        state_(2) = vel(0);  // vx
-        state_(3) = vel(1);  // vy
+        state_(2) = pos.altitude;
+        state_(3) = vel(0);  // vn
+        state_(4) = vel(1);  // ve
+        state_(5) = vel(2);  // vh
+        state_(6) = 0.0;     // начальный дрейф
         is_initialized_ = true;
     }
 
-    void predict(double dt) {
+      void predict(double dt) {
+        // Создаём нулевые измерения, когда у нас нет данных IMU
+        IMUData zero_imu;
+        zero_imu.acceleration = Eigen::Vector3d::Zero();
+        zero_imu.angular_velocity = Eigen::Vector3d::Zero();
+        
+        // Используйте основной метод прогнозирования с нулевыми измерениями
+        predict(zero_imu, dt);
+    }
+void predict(const IMUData& imu_data, double dt) {
         if (!is_initialized_) {
             throw std::runtime_error("EKF not initialized");
         }
 
-        try {
-            // Матрица перехода состояния
-            Eigen::MatrixXd F = Eigen::MatrixXd::Identity(STATE_SIZE, STATE_SIZE);
-            F.block<2,2>(0,2) = dt * Eigen::Matrix2d::Identity();
-            
-            // Предсказание состояния и ковариации
-            state_ = F * state_;
-            covariance_ = F * covariance_ * F.transpose() + process_noise_ * dt;
+        // Извлекаем ускорение и угловую скорость из данных IMU
+        Eigen::Vector3d acceleration = imu_data.acceleration;
+        Eigen::Vector3d angular_velocity = imu_data.angular_velocity;
+
+        // Используем эти измерения для прогнозирования состояния
+        Eigen::VectorXd predicted_state = nonlinearStatePredict(state_, acceleration, angular_velocity, dt);
+        
+        // Расчет матрицы Якобиана для этого шага прогнозирования
+        Eigen::MatrixXd F = calculateJacobian(state_, acceleration, dt);
+        
+        // Обновление состояния и ковариации
+        state_ = predicted_state;
+        covariance_ = F * covariance_ * F.transpose() + process_noise_ * dt;
+    }
+
+
+    void predict(const Eigen::Vector3d& acceleration, const Eigen::Vector3d& angular_velocity, double dt) {
+        if (!is_initialized_) {
+            throw std::runtime_error("EKF not initialized");
         }
-        catch (const std::exception& e) {
-            throw std::runtime_error(std::string("Error in EKF prediction: ") + e.what());
-        }
+
+        // Предсказание новоого состояния, используя нелинейную модель
+        Eigen::VectorXd predicted_state = nonlinearStatePredict(state_, acceleration, angular_velocity, dt);
+        
+        // Расчет матрицы Якобиана
+        Eigen::MatrixXd F = calculateJacobian(state_, acceleration, dt);
+        
+        // Обновление состояния и ковариации
+        state_ = predicted_state;
+        covariance_ = F * covariance_ * F.transpose() + process_noise_ * dt;
     }
 
     void update(const Eigen::VectorXd& measurement, const Eigen::MatrixXd& R) {
@@ -813,58 +1017,76 @@ public:
         }
 
         try {
-            if (measurement.size() != MEAS_SIZE || R.rows() != MEAS_SIZE || R.cols() != MEAS_SIZE) {
-                throw std::runtime_error("Invalid measurement dimensions");
-            }
-
-            // Матрица измерений
-            Eigen::MatrixXd H = Eigen::MatrixXd::Identity(MEAS_SIZE, STATE_SIZE);
+            // Матрица измерений (для прямых измерений позиции и скорости)
+            Eigen::MatrixXd H = Eigen::MatrixXd::Zero(MEAS_SIZE, STATE_SIZE);
+            H.topLeftCorner(MEAS_SIZE, MEAS_SIZE) = Eigen::MatrixXd::Identity(MEAS_SIZE, MEAS_SIZE);
             
-            // Инновация
-            Eigen::VectorXd innovation = measurement - H * state_;
+            // Вычисление инновации
+            latest_innovation_ = measurement - H * state_;
             
-            // Нормализация разности углов
-            innovation(0) = std::fmod(innovation(0) + 180.0, 360.0) - 180.0;
-            innovation(1) = std::fmod(innovation(1) + 180.0, 360.0) - 180.0;
-            
-            // Ковариация инновации
+            // Нормализация угловых компонент инновации
+            latest_innovation_ (0) = std::fmod(latest_innovation_ (0) + 180.0, 360.0) - 180.0;  // широта
+            latest_innovation_ (1) = std::fmod(latest_innovation_ (1) + 180.0, 360.0) - 180.0;  // долгота
+                        
+            // Вычисление NIS
             Eigen::MatrixXd S = H * covariance_ * H.transpose() + R;
+            latest_nis_ = latest_innovation_.transpose() * S.inverse() * latest_innovation_;
             
-            // Усиление Калмана
+            adaptProcessNoise(latest_innovation_);
+
+            // Вычисление усиления Калмана
             Eigen::MatrixXd K = covariance_ * H.transpose() * S.inverse();
             
+      
+
             // Обновление состояния и ковариации
-            state_ += K * innovation;
+            state_ += K * latest_innovation_;
             covariance_ = (Eigen::MatrixXd::Identity(STATE_SIZE, STATE_SIZE) - K * H) * covariance_;
         }
         catch (const std::exception& e) {
             throw std::runtime_error(std::string("Error in EKF update: ") + e.what());
         }
     }
+    
+    EKFData getDebugData() const {
+    EKFData data;
+    data.state = state_;
+    data.covariance = covariance_;
+    data.innovation = latest_innovation_;
+    data.innovation_mahalanobis = latest_nis_;
+    data.estimation_mahalanobis = latest_nees_;
+    data.process_noise_scale = current_scale_;
+    return data;
+    }   
 
     Position getPosition() const {
         Position pos;
         pos.latitude = state_(0);
         pos.longitude = state_(1);
-        pos.altitude = 0.0;  // Высота обрабатывается отдельно
+        pos.altitude = state_(2);
         return pos;
     }
 
     Eigen::Vector3d getVelocity() const {
         Eigen::Vector3d vel;
-        vel << state_(2), state_(3), 0.0;
+        vel << state_(3), state_(4), state_(5);
         return vel;
+    }
+
+    double getDrift() const {
+        return state_(6);
     }
 
     bool isInitialized() const {
         return is_initialized_;
     }
+
 };
 
 // Класс гибридной навигационной системы с двумя методами слабосвязанной интеграции
 class HybridNavigationSystem {
 private:
-
+    RouteManager route_manager_;
     static constexpr double UPDATE_RATE = 0.1;  // 10 Hz
     UAVModel uav_;
     INS ins_;
@@ -872,7 +1094,6 @@ private:
 
     ExtendedKalmanFilter ekf_weighted_;
     ExtendedKalmanFilter ekf_position_;    // EKF для интеграции по положению/скорости
-    RouteManager route_manager_;
     
     Position ins_position_;
     Position gnss_position_;
@@ -1042,6 +1263,9 @@ public:
         Logger::log(Logger::INFO, "Hybrid navigation system initialized");
     }
     
+    Position getTargetPosition() const {
+        return route_manager_.getTargetPosition();
+    }
    void processBaroData(const BaroData& baro_data) {
         std::lock_guard<std::mutex> lock(integration_mutex_);
         
@@ -1082,6 +1306,7 @@ public:
             if (!route_manager_.loadRouteFromFile(route_file)) {
                 return false;
             }
+            
 
             Position initial_position = route_manager_.getTargetPosition();
             uav_.setPosition(initial_position);
@@ -1268,11 +1493,17 @@ private:
 // Класс симуляции навигации
 class NavigationSimulation {
 private:
+    Position current_position_;
+    Eigen::Vector3d current_velocity_;
+
+    std::random_device rd_;
+    std::mt19937 gen_;
+
     HybridNavigationSystem nav_system_;
     std::atomic<bool> running_;
     std::atomic<bool> route_completed_{false};
     NavigationDataLogger data_logger_;
-    
+    ExtendedKalmanFilter ekf_; 
     std::thread ins_thread_;
     std::thread gnss_thread_;
     std::thread deviation_thread_;
@@ -1335,38 +1566,23 @@ private:
             auto start_time = std::chrono::steady_clock::now();
             
             try {
-                Position current_pos = nav_system_.getState().position;
-                Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+                NavigationState current_state = nav_system_.getState();
+                Position current_pos = current_state.position;
+                Eigen::Vector3d velocity(current_state.current_speed_kmh / 3.6, 0.0, 0.0);
 
                 IMUData imu_data = generateIMUData(current_pos, velocity);
                 nav_system_.processINSData(imu_data, INS_UPDATE_INTERVAL.count() / 1000.0);
                 
-                // Логируем данные каждую секунду
+                // Обновление EKF
+                ekf_.predict(imu_data, INS_UPDATE_INTERVAL.count() / 1000.0);
+                
                 auto current_time = std::chrono::steady_clock::now();
                 if (current_time - last_log_time_ >= DATA_LOG_INTERVAL) {
-
-                    double raw_ins_error = nav_system_.getRawINSError();
-                    Logger::log(Logger::DEBUG, "Current INS error: " + std::to_string(raw_ins_error) + " m");
-                    
                     LoggedData true_data = nav_system_.getTrueData();
                     LoggedData ins_data = nav_system_.getINSData();
                     LoggedData gnss_data = nav_system_.getGNSSData();
                     LoggedData weighted_data = nav_system_.getWeightedData();
                     LoggedData position_based_data = nav_system_.getPositionBasedData();
-
-                    // Вычисление ошибок
-                    double ins_error = calculatePositionError(true_data.position, ins_data.position);
-                    double gnss_error = calculatePositionError(true_data.position, gnss_data.position);
-                    double weighted_error = calculatePositionError(true_data.position, weighted_data.position);
-                    double pos_based_error = calculatePositionError(true_data.position, position_based_data.position);
-
-                    // Вывод ошибок
-                    std::cout << "\nPosition Errors:\n"
-                     << "Raw INS Error: " << std::fixed << std::setprecision(2) 
-                     << ins_error  << " m\n"
-                     << "GNSS Error: " << gnss_error << " m\n"
-                     << "Weighted Integration Error: " << weighted_error << " m\n"
-                     << "Position/Velocity Integration Error: " << pos_based_error << " m\n";
 
                     data_logger_.logNavigationData(
                         true_data,
@@ -1375,9 +1591,14 @@ private:
                         weighted_data,
                         position_based_data,
                         nav_system_.getINSTrustWeight(),
-                        nav_system_.getGNSSTrustWeight()
+                        nav_system_.getGNSSTrustWeight(),
+                        ekf_.getDebugData()
                     );
+                    
                     last_log_time_ = current_time;
+                    
+                    Logger::log(Logger::DEBUG, "Current INS error: " + 
+                        std::to_string(nav_system_.getRawINSError()) + " m");
                 }
             }
             catch (const std::exception& e) {
@@ -1387,19 +1608,41 @@ private:
             std::this_thread::sleep_until(start_time + INS_UPDATE_INTERVAL);
         }
     }
+
     
     void gnssLoop() {
         Logger::log(Logger::INFO, "Starting GNSS loop");
         
-        while (running_) {
+         while (running_) {
             auto start_time = std::chrono::steady_clock::now();
             
             try {
-                Position current_pos = nav_system_.getState().position;
-                Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
-
-                GNSSData gnss_data = generateGNSSData(current_pos, velocity);
+                // Use class member variables
+                GNSSData gnss_data = generateGNSSData(current_position_, current_velocity_);
                 nav_system_.processGNSSData(gnss_data);
+                
+                // Update EKF with GNSS measurements
+                Eigen::VectorXd measurement = Eigen::VectorXd::Zero(6);
+                measurement << gnss_data.position.latitude,
+                              gnss_data.position.longitude,
+                              gnss_data.position.altitude,
+                              gnss_data.velocity.x(),
+                              gnss_data.velocity.y(),
+                              gnss_data.velocity.z();
+                
+                // Create measurement covariance matrix
+                Eigen::MatrixXd R = Eigen::MatrixXd::Identity(6, 6);
+                double pos_variance = std::pow(gnss_data.hdop * 2.0, 2);
+                double vel_variance = 0.1;
+                
+                R.topLeftCorner(3,3) *= pos_variance;
+                R.bottomRightCorner(3,3) *= vel_variance;
+                
+                ekf_.update(measurement, R);
+                
+                // Update current position and velocity
+                current_position_ = gnss_data.position;
+                current_velocity_ = gnss_data.velocity;
             }
             catch (const std::exception& e) {
                 Logger::log(Logger::ERROR, "Error in GNSS loop: " + std::string(e.what()));
@@ -1408,6 +1651,7 @@ private:
             std::this_thread::sleep_until(start_time + GNSS_UPDATE_INTERVAL);
         }
     }
+
     
     void deviationLoop() {
     Logger::log(Logger::INFO, "Запуск цикла мониторинга отклонений");
@@ -1508,28 +1752,55 @@ private:
 }
 
     IMUData generateIMUData(const Position& current_pos, const Eigen::Vector3d& velocity) {
-        // Создаем IMU данные напрямую, без создания отдельного экземпляра INS
         IMUData data;
-        data.timestamp = std::chrono::system_clock::now();
-
-        // Базовые значения ускорения из текущей скорости
-        Eigen::Vector3d base_acceleration = velocity / UPDATE_RATE;
         
-        // Добавляем небольшой шум
-        std::normal_distribution<> noise(0.0, 0.01);
-        static std::random_device rd;
-        static std::mt19937 gen(rd());
+        // Получаем текущее состояние от навигационной системы
+        NavigationState state = nav_system_.getState();
         
-        for(int i = 0; i < 3; ++i) {
-            data.acceleration[i] = base_acceleration[i] + noise(gen);
-            data.angular_velocity[i] = noise(gen);
+        // Вычисляем ускорения на основе текущей скорости и положения
+        Eigen::Vector3d target_velocity;
+        Position target_pos = nav_system_.getTargetPosition();
+        
+        // Вычисляем желаемое направление движения
+        double bearing = RouteManager::calculateBearing(current_pos, target_pos);
+        double distance = RouteManager::calculateDistance(current_pos, target_pos);
+        
+        // Преобразуем курсовой угол в радианы
+        double bearing_rad = bearing * M_PI / 180.0;
+        
+        // Определяем желаемую скорость
+        double desired_speed = (distance < 10.0) ? 
+            std::min(15.0 * (distance / 10.0), 15.0) : 15.0;
+        
+        // Вычисляем компоненты целевой скорости
+        target_velocity.x() = desired_speed * cos(bearing_rad);
+        target_velocity.y() = desired_speed * sin(bearing_rad);
+        target_velocity.z() = (target_pos.altitude - current_pos.altitude) * 0.2;
+        
+        // Вычисляем ускорение как разность скоростей
+        Eigen::Vector3d acceleration = (target_velocity - velocity) / 0.1; // dt = 0.1s
+        
+        // Ограничиваем ускорение
+        double max_acceleration = 2.0;
+        if (acceleration.norm() > max_acceleration) {
+            acceleration = acceleration.normalized() * max_acceleration;
         }
-
-        // Добавляем ускорение свободного падения
+        
+        // Добавляем случайный шум к измерениям
+        std::normal_distribution<> noise(0.0, 0.01);
+        for(int i = 0; i < 3; ++i) {
+            data.acceleration[i] = acceleration[i] + noise(gen_);
+            data.angular_velocity[i] = noise(gen_);
+        }
+        
+        // Добавляем гравитацию к вертикальному ускорению
         data.acceleration.z() += 9.80665;
+        
+        data.timestamp = std::chrono::system_clock::now();
         
         return data;
     }
+
 
 
     GNSSData generateGNSSData(const Position& current_pos, const Eigen::Vector3d& velocity) {
@@ -1561,7 +1832,11 @@ private:
     }
     
 public:
-    NavigationSimulation() : running_(false), route_completed_(false) {
+     NavigationSimulation() 
+        : running_(false)
+        , route_completed_(false)
+        , gen_(rd_()) 
+    {
         Logger::log(Logger::INFO, "Navigation simulation created");
     }
     
@@ -1581,8 +1856,32 @@ public:
                 Logger::log(Logger::ERROR, "Failed to initialize simulation");
                 return false;
             }
-            Logger::log(Logger::INFO, "Simulation initialized successfully");
-            return true;
+                    // Получаем начальную позицию из первой путевой точки
+        Position initial_position = nav_system_.getState().position;
+        
+        // Инициализируем EKF начальными значениями
+        Eigen::VectorXd initial_state = Eigen::VectorXd::Zero(7);  // [lat, lon, alt, vn, ve, vh, drift]
+        initial_state(0) = initial_position.latitude;
+        initial_state(1) = initial_position.longitude;
+        initial_state(2) = initial_position.altitude;
+        // Начальные скорости устанавливаем в 0
+        initial_state(3) = 0.0;  // vn
+        initial_state(4) = 0.0;  // ve
+        initial_state(5) = 0.0;  // vh
+        initial_state(6) = 0.0;  // drift
+
+        // Создаем начальную ковариационную матрицу
+        Eigen::MatrixXd initial_covariance = Eigen::MatrixXd::Identity(7, 7);
+        // Настраиваем начальные неопределенности для разных компонент состояния
+        initial_covariance.topLeftCorner(3,3) *= 1e-10;     // Позиция (рад²)
+        initial_covariance.block(3,3,3,3) *= 0.01;          // Скорость (м²/с²)
+        initial_covariance(6,6) = 0.0001;                   // Дрейф (м²/с⁴)
+
+        // Инициализируем EKF
+        ekf_.setState(initial_position, Eigen::Vector3d::Zero());
+
+        Logger::log(Logger::INFO, "Simulation initialized successfully");
+        return true;
         }
         catch (const std::exception& e) {
             Logger::log(Logger::ERROR, "Error during initialization: " + std::string(e.what()));

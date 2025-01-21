@@ -1,55 +1,78 @@
+// data_logger.cpp
+
 #include "data_logger.hpp"
 #include <cstdlib>
 #include <cerrno>
 #include <cstring>
 
-std::string NavigationDataLogger::DataRecord::toCSVHeader() const {
-    return "Timestamp,"
-           "True_Lat,True_Lon,True_Alt,"
-           "INS_Lat,INS_Lon,INS_Alt,"
-           "GNSS_Lat,GNSS_Lon,GNSS_Alt,"
-           "Weighted_Lat,Weighted_Lon,Weighted_Alt,"
-           "PosBased_Lat,PosBased_Lon,PosBased_Alt,"
-           "INS_Error,GNSS_Error,Weighted_Error,PosBased_Error,"
-           "INS_Weight,GNSS_Weight,"
-           "Route_Deviation,Distance_to_WP,Current_WP,Speed_KMH,"
-           "GNSS_Available,HDOP,Satellites,"
-           "Accel_X,Accel_Y,Accel_Z,"
-           "AngVel_X,AngVel_Y,AngVel_Z,"
-           "Is_Running";
-}
-
 std::string NavigationDataLogger::DataRecord::toCSVRow() const {
-    auto time_t = std::chrono::system_clock::to_time_t(timestamp);
+     // Используем stringstream для форматированного вывода чисел с нужной точностью
     std::stringstream ss;
+    
+    // Форматируем временную метку в читаемый вид
+    auto time_t = std::chrono::system_clock::to_time_t(timestamp);
     ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") << ",";
     
-    ss << true_position.toString() << ","
-       << ins_position.toString() << ","
-       << gnss_position.toString() << ","
-       << weighted_position.toString() << ","
-       << position_based_position.toString() << ",";
+    // Записываем истинные координаты с высокой точностью (9 знаков после запятой)
+    ss << std::fixed << std::setprecision(9)
+       << true_lat << "," << true_lon << "," 
+       << std::setprecision(3) << true_alt << ",";  // Высота с меньшей точностью
     
-    ss << std::fixed << std::setprecision(3)
-       << ins_error << "," << gnss_error << ","
-       << weighted_error << "," << position_based_error << ",";
+    // Координаты от ИНС
+    ss << std::setprecision(9)
+       << ins_lat << "," << ins_lon << ","
+       << std::setprecision(3) << ins_alt << ",";
     
-    ss << std::fixed << std::setprecision(3)
-       << ins_trust_weight << "," << gnss_trust_weight << ",";
+    // Координаты от ГНСС
+    ss << std::setprecision(9)
+       << gnss_lat << "," << gnss_lon << ","
+       << std::setprecision(3) << gnss_alt << ",";
     
-    ss << std::fixed << std::setprecision(2)
-       << deviation << "," << distance_to_waypoint << ","
-       << current_waypoint << "," << speed_kmh << ",";
+    // Координаты после весовой интеграции
+    ss << std::setprecision(9)
+       << weighted_lat << "," << weighted_lon << ","
+       << std::setprecision(3) << weighted_alt << ",";
     
-    ss << (gnss_available ? "1" : "0") << ","
-       << std::setprecision(3) << hdop << ","
-       << satellites << ",";
+    // Координаты от EKF
+    ss << std::setprecision(9)
+       << ekf_lat << "," << ekf_lon << ","
+       << std::setprecision(3) << ekf_alt << ",";
     
-    ss << std::setprecision(6)
-       << acceleration_x << "," << acceleration_y << "," << acceleration_z << ","
-       << angular_velocity_x << "," << angular_velocity_y << "," << angular_velocity_z << ",";
+    // Полный вектор состояния EKF
+    ss << std::setprecision(6);
+    for(int i = 0; i < 7; i++) {
+        ss << ekf_state[i] << ",";
+    }
     
-    ss << (is_running ? "1" : "0");
+    // Диагональные элементы ковариационной матрицы EKF
+    ss << std::scientific << std::setprecision(6);  // Экспоненциальный формат для малых чисел
+    for(int i = 0; i < 7; i++) {
+        ss << ekf_covariance_diag[i] << ",";
+    }
+    
+    // Вектор инноваций EKF
+    ss << std::fixed << std::setprecision(6);
+    for(int i = 0; i < 6; i++) {
+        ss << ekf_innovation[i] << ",";
+    }
+    
+    // Статистика работы EKF
+    ss << ekf_nis << ","
+       << ekf_nees << ","
+       << ekf_process_noise_scale << ",";
+    
+    // Ошибки различных подсистем
+    ss << std::setprecision(3)
+       << ins_weight << ","
+       << gnss_weight << ","
+       << route_deviation << ","
+       << distance_to_next << ","
+       << current_waypoint << ","
+       << std::setprecision(1) << current_speed_kmh << ",";
+    
+    // Параметры качества ГНСС
+    ss << std::setprecision(2) << hdop << ","
+       << satellites_visible;
     
     return ss.str();
 }
@@ -136,49 +159,38 @@ void NavigationDataLogger::logNavigationData(
     const LoggedData& weighted_data,
     const LoggedData& position_based_data,
     double ins_weight,
-    double gnss_weight)
+    double gnss_weight,
+    const EKFData& ekf_data)
 {
-    DataRecord record;
-    record.timestamp = std::chrono::system_clock::now();
-    
-    record.true_position = true_data.position;
-    record.ins_position = ins_data.position;
-    record.gnss_position = gnss_data.position;
-    record.weighted_position = weighted_data.position;
-    record.position_based_position = position_based_data.position;
-    
-    record.ins_error = ins_data.position_error;
-    record.gnss_error = record.true_position.distanceTo(record.gnss_position);
-    record.weighted_error = record.true_position.distanceTo(record.weighted_position);
-    record.position_based_error = record.true_position.distanceTo(record.position_based_position);
-    
-    record.ins_trust_weight = ins_weight;
-    record.gnss_trust_weight = gnss_weight;
-    
-    record.deviation = true_data.deviation;
-    record.distance_to_waypoint = true_data.distance_to_next;
-    record.current_waypoint = true_data.current_waypoint;
-    record.speed_kmh = true_data.current_speed_kmh;
-    
-    record.gnss_available = true_data.gnss_available;
-    record.hdop = true_data.hdop;
-    record.satellites = true_data.satellites_visible;
-    
-    record.acceleration_x = true_data.acceleration.x();
-    record.acceleration_y = true_data.acceleration.y();
-    record.acceleration_z = true_data.acceleration.z();
-    record.angular_velocity_x = true_data.angular_velocity.x();
-    record.angular_velocity_y = true_data.angular_velocity.y();
-    record.angular_velocity_z = true_data.angular_velocity.z();
-    
-    record.is_running = true_data.is_running;
-    
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        data_queue_.push(record);
+    try {
+        DataRecord record;
+        record.timestamp = std::chrono::system_clock::now();
+        
+        // Заполняем все поля записи
+        fillPositionData(record, true_data, ins_data, gnss_data, 
+                        weighted_data, position_based_data);
+        fillEKFData(record, ekf_data);
+        
+        // Заполняем навигационные параметры
+        record.ins_weight = ins_weight;
+        record.gnss_weight = gnss_weight;
+        record.route_deviation = true_data.deviation;
+        record.distance_to_next = true_data.distance_to_next;
+        record.current_waypoint = true_data.current_waypoint;
+        record.current_speed_kmh = true_data.current_speed_kmh;
+        record.hdop = gnss_data.hdop;
+        record.satellites_visible = gnss_data.satellites_visible;
+        
+        // Добавляем запись в очередь
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            data_queue_.push(record);
+            total_records_++;
+        }
     }
-    
-    total_records_++;
+    catch (const std::exception& e) {
+        Logger::log(Logger::ERROR, "Error logging navigation data: " + std::string(e.what()));
+    }
 }
 
 NavigationDataAnalyzer::SystemAccuracy 
@@ -373,93 +385,121 @@ void NavigationDataAnalyzer::generateGnuplotScript(const std::string& csv_filena
     try {
         std::string data_dir = "data";
         if (system(("mkdir -p " + data_dir).c_str()) != 0) {
-            throw std::runtime_error("Не удалось создать директорию данных");
+            throw std::runtime_error("Failed to create data directory");
         }
 
         std::string script_file = data_dir + "/plot_navigation.gnuplot";
         std::ofstream script(script_file);
         if (!script.is_open()) {
-            throw std::runtime_error("Не удалось создать файл скрипта: " + script_file);
+            throw std::runtime_error("Failed to create gnuplot script file");
         }
 
-        // Базовые настройки
-        script << "set terminal png size 1600,1000\n"
+        // Базовые настройки Gnuplot
+        script << "# Базовые настройки для всех графиков\n"
+               << "set terminal png size 1600,1000\n"
                << "set grid\n"
                << "set datafile separator ','\n"
-               << "# Пропускаем первую строку с заголовками\n"
                << "set datafile missing 'NaN'\n"
-               << "set key outside right\n\n"
-               << "# Устанавливаем формат данных\n"
-               << "set decimal locale\n"
-               << "set format y '%g'\n\n";
+               << "set key outside right\n"
+               << "set style line 1 lc rgb '#0060ad' lw 2\n"
+               << "set style line 2 lc rgb '#dd181f' lw 2\n"
+               << "set style line 3 lc rgb '#00cc00' lw 2\n"
+               << "set style line 4 lc rgb '#ff9900' lw 2\n\n";
 
-        // График профиля высоты
-        // Колонки: True_Alt = 3, INS_Alt = 6, GNSS_Alt = 9
-        script << "set output '" << data_dir << "/altitude_profile.png'\n"
-               << "set title 'Профиль высоты'\n"
-               << "set xlabel 'Время (с)'\n"
-               << "set ylabel 'Высота (м)'\n"
-               << "set yrange [190:310]\n"
-               << "# Используем every для уменьшения шума на графике\n"
-               << "plot '" << csv_filename << "' every ::1 using 0:3 title 'Истинная' with lines,\\\n"
-               << "     '' every ::1 using 0:6 title 'ИНС' with lines,\\\n"
-               << "     '' every ::1 using 0:9 title 'ГНСС' with lines\n\n";
-
-        // График траектории
-        // Колонки: True_Lat/Lon = 1,2; INS_Lat/Lon = 4,5; GNSS_Lat/Lon = 7,8; 
-        // Weighted_Lat/Lon = 10,11; PosBased_Lat/Lon = 13,14
-        script << "set output '" << data_dir << "/trajectory.png'\n"
+        // График траектории в горизонтальной плоскости
+        script << "# Траектория движения БПЛА\n"
+               << "set output '" << data_dir << "/trajectory.png'\n"
                << "set title 'Траектория полета'\n"
                << "set xlabel 'Долгота'\n"
                << "set ylabel 'Широта'\n"
                << "set size ratio -1\n"
-               << "plot '" << csv_filename << "' every ::1 using 2:1 title 'Истинная' with lines,\\\n"
-               << "     '' every ::1 using 5:4 title 'ИНС' with lines,\\\n"
-               << "     '' every ::1 using 8:7 title 'ГНСС' with lines,\\\n"
-               << "     '' every ::1 using 11:10 title 'Весовая интеграция' with lines,\\\n"
-               << "     '' every ::1 using 14:13 title 'Поз./скор. интеграция' with lines\n\n";
+               << "plot '" << csv_filename << "' every ::1 using 3:2 title 'Истинная' with lines ls 1,\\\n"
+               << "     '' every ::1 using 6:5 title 'ИНС' with lines ls 2,\\\n"
+               << "     '' every ::1 using 9:8 title 'ГНСС' with lines ls 3,\\\n"
+               << "     '' every ::1 using 12:11 title 'Весовая интеграция' with lines ls 4,\\\n"
+               << "     '' every ::1 using 15:14 title 'EKF' with lines ls 5\n\n";
 
-        // График HDOP и спутников
-        // Колонки: HDOP = 28, Satellites = 29
-        script << "set output '" << data_dir << "/gnss_quality.png'\n"
-               << "set title 'Качество сигнала ГНСС'\n"
+        // График изменения высоты
+        script << "# Профиль высоты\n"
+               << "set output '" << data_dir << "/altitude_profile.png'\n"
+               << "set title 'Изменение высоты'\n"
                << "set xlabel 'Время (с)'\n"
-               << "set ylabel 'HDOP'\n"
-               << "set y2label 'Количество спутников'\n"
-               << "set ytics nomirror\n"
-               << "set y2tics\n"
-               << "set yrange [0:*]\n"
-               << "set y2range [0:15]\n"
-               << "plot '" << csv_filename << "' every ::1 using 0:28 title 'HDOP' with lines axis x1y1,\\\n"
-               << "     '' every ::1 using 0:29 title 'Спутники' with lines axis x1y2\n\n";
+               << "set ylabel 'Высота (м)'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):4 title 'Истинная' with lines ls 1,\\\n"
+               << "     '' every ::1 using ($0/10):7 title 'ИНС' with lines ls 2,\\\n"
+               << "     '' every ::1 using ($0/10):10 title 'ГНСС' with lines ls 3,\\\n"
+               << "     '' every ::1 using ($0/10):16 title 'EKF' with lines ls 5\n\n";
 
-        // График сходимости EKF
-        script << "set output '" << data_dir << "/ekf_convergence.png'\n"
-               << "set title 'Сходимость оценок EKF'\n"
+        // График ошибок позиционирования
+        script << "# Ошибки определения координат\n"
+               << "set output '" << data_dir << "/position_errors.png'\n"
+               << "set title 'Ошибки определения координат'\n"
                << "set xlabel 'Время (с)'\n"
                << "set ylabel 'Ошибка (м)'\n"
-               << "# Вычисляем ошибку как расстояние между истинным и оцененным положением\n"
-               << "plot '" << csv_filename << "' every ::1 using 0:(sqrt(($2-$14)*($2-$14) + ($1-$13)*($1-$13))) title 'Ошибка EKF' with lines\n\n";
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):37 title 'ИНС' with lines ls 2,\\\n"
+               << "     '' every ::1 using ($0/10):38 title 'ГНСС' with lines ls 3,\\\n"
+               << "     '' every ::1 using ($0/10):39 title 'Весовая интеграция' with lines ls 4,\\\n"
+               << "     '' every ::1 using ($0/10):40 title 'EKF' with lines ls 5\n\n";
 
-        // График инновационной последовательности
-        script << "set output '" << data_dir << "/ekf_innovation_sequence.png'\n"
-               << "set title 'Инновационная последовательность EKF'\n"
+        // График весовых коэффициентов
+        script << "# Весовые коэффициенты интеграции\n"
+               << "set output '" << data_dir << "/weights.png'\n"
+               << "set title 'Весовые коэффициенты'\n"
                << "set xlabel 'Время (с)'\n"
-               << "set ylabel 'Невязка (м)'\n"
-               << "# Вычисляем невязки как разность между измерениями ГНСС и оценками EKF\n"
-               << "plot '" << csv_filename << "' every ::1 using 0:($8-$14) title 'Невязка по широте' with lines,\\\n"
-               << "     '' every ::1 using 0:($7-$13) title 'Невязка по долготе' with lines\n";
+               << "set ylabel 'Вес'\n"
+               << "set yrange [0:1]\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):41 title 'Вес ИНС' with lines ls 1,\\\n"
+               << "     '' every ::1 using ($0/10):42 title 'Вес ГНСС' with lines ls 2\n\n";
+
+        // График статистики ГНСС
+        script << "# Качество сигнала ГНСС\n"
+               << "set output '" << data_dir << "/gnss_quality.png'\n"
+               << "set multiplot layout 2,1\n"
+               << "set title 'Параметры качества ГНСС'\n"
+               << "set xlabel 'Время (с)'\n"
+               << "set ylabel 'HDOP'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):47 title 'HDOP' with lines ls 1\n"
+               << "set ylabel 'Количество спутников'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):48 title 'Видимые спутники' with lines ls 2\n"
+               << "unset multiplot\n\n";
+
+        // Графики для анализа работы EKF
+        script << "# Анализ работы EKF\n"
+               << "set output '" << data_dir << "/ekf_innovations.png'\n"
+               << "set title 'Инновации EKF с границами 3σ'\n"
+               << "set xlabel 'Время (с)'\n"
+               << "set ylabel 'Инновация'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):28 title 'Инновация позиции' with lines ls 1,\\\n"
+               << "     '' every ::1 using ($0/10):($28+3*sqrt($21)) title '+3σ' with lines ls 2,\\\n"
+               << "     '' every ::1 using ($0/10):($28-3*sqrt($21)) title '-3σ' with lines ls 2\n\n";
+
+        // График NIS/NEES
+        script << "# Консистентность оценок EKF\n"
+               << "set output '" << data_dir << "/ekf_consistency.png'\n"
+               << "set multiplot layout 2,1\n"
+               << "set title 'Показатели согласованности EKF'\n"
+               << "set xlabel 'Время (с)'\n"
+               << "set ylabel 'NIS'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):34 title 'NIS' with lines ls 1,\\\n"
+               << "     12.59 title '95% χ²' with lines ls 2\n"
+               << "set ylabel 'NEES'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):35 title 'NEES' with lines ls 1,\\\n"
+               << "     7.81 title '95% χ²' with lines ls 2\n"
+               << "unset multiplot\n\n";
+
+        // График адаптивного масштаба шума процесса
+        script << "# Адаптивная настройка EKF\n"
+               << "set output '" << data_dir << "/ekf_adaptive.png'\n"
+               << "set title 'Масштаб шума процесса'\n"
+               << "set xlabel 'Время (с)'\n"
+               << "set ylabel 'Масштабный коэффициент'\n"
+               << "plot '" << csv_filename << "' every ::1 using ($0/10):36 title 'Масштаб Q' with lines ls 1\n";
 
         script.close();
-        
-        if (!script) {
-            throw std::runtime_error("Ошибка при записи скрипта gnuplot");
-        }
-
-        Logger::log(Logger::INFO, "Скрипт gnuplot успешно создан");
+        Logger::log(Logger::INFO, "Gnuplot script generated successfully");
     }
     catch (const std::exception& e) {
-        Logger::log(Logger::ERROR, "Ошибка при генерации скрипта gnuplot: " + std::string(e.what()));
+        Logger::log(Logger::ERROR, "Error generating gnuplot script: " + std::string(e.what()));
         throw;
     }
 }
